@@ -253,6 +253,11 @@ class Tensor:
         self._ensure_cpu()
         return float(self._data)
 
+    def __reduce__(self):
+        """Pickle support — download GPU data first."""
+        self._ensure_cpu()
+        return (Tensor, (self._data, None, str(self._device), self._requires_grad))
+
     # ------------------------------------------------------------------ #
     #  Helpers for building autograd graph                                #
     # ------------------------------------------------------------------ #

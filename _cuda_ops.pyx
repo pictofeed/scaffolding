@@ -291,6 +291,29 @@ cdef class CudaBuffer:
     def size(self):
         return self.nbytes
 
+    def __reduce__(self):
+        # Download data for pickling (GPU pointers can't be serialized)
+        cdef np.ndarray arr
+        if self.ptr != NULL and self.nbytes > 0:
+            arr = np.empty(self.nbytes // sizeof(float), dtype=np.float32)
+            cudaMemcpy(<void*>np.PyArray_DATA(arr), self.ptr,
+                       self.nbytes, cudaMemcpyDeviceToHost)
+            return (_rebuild_cuda_buffer, (arr,))
+        return (_rebuild_cuda_buffer, (None,))
+
+
+def _rebuild_cuda_buffer(np.ndarray arr):
+    """Reconstruct a CudaBuffer from pickled numpy data."""
+    if arr is None:
+        return CudaBuffer()
+    cdef size_t nbytes = arr.nbytes
+    cdef int device = 0
+    cudaGetDevice(&device)
+    cdef CudaBuffer buf = _make_buffer(nbytes, device)
+    _check_cuda(cudaMemcpy(buf.ptr, <void*>np.PyArray_DATA(arr),
+                           nbytes, cudaMemcpyHostToDevice))
+    return buf
+
 
 cdef CudaBuffer _make_buffer(size_t nbytes, int device_id):
     """Allocate a new device buffer."""
