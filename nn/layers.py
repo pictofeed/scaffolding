@@ -320,6 +320,95 @@ class GELU(Module):
 
 # ──────────────────────── DataParallel stub ───────────────────────────
 
+
+class LayerNorm(Module):
+    """Layer Normalization (Ba et al., 2016).
+
+    Normalizes over the last *normalized_shape* dimensions.
+    Mirrors ``torch.nn.LayerNorm``.
+    """
+
+    def __init__(self, normalized_shape, eps: float = 1e-5,
+                 elementwise_affine: bool = True):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.elementwise_affine = elementwise_affine
+        if elementwise_affine:
+            self.weight = Parameter(Tensor(np.ones(self.normalized_shape,
+                                                  dtype=np.float32)))
+            self.bias = Parameter(Tensor(np.zeros(self.normalized_shape,
+                                                  dtype=np.float32)))
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, x: Tensor) -> Tensor:
+        # CUDA fast-path
+        if _USE_CUDA and _is_cuda(x._device):
+            gamma = self.weight._data if self.weight is not None else None
+            beta = self.bias._data if self.bias is not None else None
+            y, _mean, _rstd = _cuops.cuda_layer_norm(
+                x._data.reshape(-1, self.normalized_shape[-1]),
+                gamma, beta, self.eps,
+            )
+            return Tensor._wrap(y.reshape(x._data.shape),
+                                x._requires_grad, None, x._device)
+
+        # Generic NumPy path
+        axes = tuple(range(-len(self.normalized_shape), 0))
+        mean = np.mean(x._data, axis=axes, keepdims=True)
+        var = np.var(x._data, axis=axes, keepdims=True)
+        x_norm = (x._data - mean) / np.sqrt(var + self.eps)
+        if self.elementwise_affine:
+            x_norm = x_norm * self.weight._data + self.bias._data
+        return Tensor._wrap(x_norm.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+    def extra_repr(self) -> str:
+        return (f'{self.normalized_shape}, eps={self.eps}, '
+                f'elementwise_affine={self.elementwise_affine}')
+
+
+class RMSNorm(Module):
+    """Root Mean Square Layer Normalization (Zhang & Sennrich, 2019).
+
+    Like LayerNorm but without re-centring (no bias subtraction).
+    """
+
+    def __init__(self, normalized_shape, eps: float = 1e-6):
+        super().__init__()
+        if isinstance(normalized_shape, int):
+            normalized_shape = (normalized_shape,)
+        self.normalized_shape = tuple(normalized_shape)
+        self.eps = eps
+        self.weight = Parameter(Tensor(np.ones(self.normalized_shape,
+                                               dtype=np.float32)))
+
+    def forward(self, x: Tensor) -> Tensor:
+        # CUDA fast-path
+        if _USE_CUDA and _is_cuda(x._device):
+            gamma = self.weight._data
+            y, _rstd = _cuops.cuda_rms_norm(
+                x._data.reshape(-1, self.normalized_shape[-1]),
+                gamma, self.eps,
+            )
+            return Tensor._wrap(y.reshape(x._data.shape),
+                                x._requires_grad, None, x._device)
+
+        # Generic NumPy path
+        axes = tuple(range(-len(self.normalized_shape), 0))
+        rms = np.sqrt(np.mean(x._data ** 2, axis=axes, keepdims=True) + self.eps)
+        x_norm = x._data / rms * self.weight._data
+        return Tensor._wrap(x_norm.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+    def extra_repr(self) -> str:
+        return f'{self.normalized_shape}, eps={self.eps}'
+
+
 class DataParallel(Module):
     """Single-node DataParallel stub.
 

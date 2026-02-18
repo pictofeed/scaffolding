@@ -20,6 +20,8 @@ from .layers import (
     SiLU,
     ReLU,
     GELU,
+    LayerNorm,
+    RMSNorm,
     DataParallel,
 )
 
@@ -39,7 +41,7 @@ __all__ = [
     'Module', 'ModuleList', 'Sequential',
     'Parameter',
     'Linear', 'Embedding', 'Conv1d', 'Dropout',
-    'SiLU', 'ReLU', 'GELU',
+    'SiLU', 'ReLU', 'GELU', 'LayerNorm', 'RMSNorm',
     'DataParallel', 'DistributedDataParallel',
     'functional', 'init', 'utils',
 ]
