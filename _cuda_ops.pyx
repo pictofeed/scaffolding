@@ -578,6 +578,8 @@ cdef cublasHandle_t _get_cublas() except *:
     global _cublas_handle, _cublas_init
     cdef cublasStatus_t status
     cdef cudaDeviceProp prop
+    cdef int dev = 0
+    cdef int sm = 0
     if not _cublas_init:
         status = cublasCreate(&_cublas_handle)
         if status != CUBLAS_STATUS_SUCCESS:
@@ -586,10 +588,9 @@ cdef cublasHandle_t _get_cublas() except *:
 
         # ------- K80 / Kepler device-level tuning at first init -------
         # Detect GPU architecture and apply K80-specific settings.
-        cdef int dev = 0
         cudaGetDevice(&dev)
         cudaGetDeviceProperties(&prop, dev)
-        cdef int sm = prop.major * 10 + prop.minor
+        sm = prop.major * 10 + prop.minor
 
         if sm <= 37:
             # K80/Kepler: prefer 48 KB L1 / 16 KB shared globally.
