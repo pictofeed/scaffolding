@@ -855,8 +855,6 @@ def dev_cross_entropy(gt_logits, gt_targets):
     cdef CudaBuffer targets_buf = <CudaBuffer>(gt_targets.buffer)
     cdef int N = gt_logits.shape[0]
     cdef int C = gt_logits.shape[1]
-    cdef size_t loss_bytes = N * sizeof(float)
-    cdef size_t logit_bytes = N * C * sizeof(float)
 
     cdef CudaBuffer d_losses = _gt_alloc(N)
     cdef CudaBuffer d_probs = _gt_alloc(N * C)

@@ -271,6 +271,11 @@ class CudaBuildExt(_build_ext):
             obj_files = []
             gencode = _gencode_flags(cuda_home)
 
+            # K80-specific: allow env override for max register count
+            # Default 64 optimizes for Kepler occupancy; set higher for
+            # compute-heavy kernels on newer GPUs
+            max_regs = int(os.environ.get('SCAFFOLDING_MAXREG', '64'))
+
             for cu_src in cuda_sources:
                 obj_name = os.path.splitext(os.path.basename(cu_src))[0]
                 obj_file = os.path.join(
@@ -279,9 +284,12 @@ class CudaBuildExt(_build_ext):
                 cmd = [
                     nvcc, '-c', cu_src, '-o', obj_file,
                     '-O3',
+                    '--use_fast_math',         # K80: enables __expf, __logf, etc.
                     '--compiler-options', "'-fPIC'" if not IS_WINDOWS else '',
                     '-DNDEBUG',
                     '-Xcompiler', '-O3',
+                    '-Xptxas', '-v',           # Print register usage (for tuning)
+                    '--maxrregcount=%d' % max_regs,  # K80: limit regs → higher occupancy
                 ] + gencode
 
                 print(f'[scaffolding] nvcc: {" ".join(cmd)}')

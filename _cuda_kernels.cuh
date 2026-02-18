@@ -52,6 +52,49 @@
 #if defined(__CUDACC__)
 
 /* ================================================================
+ *  ARCHITECTURE DETECTION — Tesla K80 (GK210, sm_37)
+ *
+ *  The K80 has two GK210 GPUs, each with:
+ *    - 13 SMX, 192 CUDA cores/SMX (2496 total)
+ *    - 64 KB configurable shared memory / L1 per SMX
+ *    - Max 2048 threads per SM, 16 resident blocks per SM
+ *    - 65536 registers per SM, max 255 per thread
+ *    - 240 GB/s GDDR5 bandwidth
+ *    - __ldg() intrinsic (read-only texture cache)
+ *    - No native FP16 compute, no tensor cores
+ *    - Warp-synchronous execution (pre-Volta: lockstep warps)
+ *
+ *  Use SCAFFOLDING_K80 macro to gate K80-specific tuning.
+ * ================================================================ */
+
+#if defined(__CUDA_ARCH__)
+  /* sm_37 = GK210 = Tesla K80 */
+  #if __CUDA_ARCH__ == 370
+    #define SCAFFOLDING_K80 1
+  #else
+    #define SCAFFOLDING_K80 0
+  #endif
+
+  /* Broad Kepler family: sm_35, sm_37 */
+  #if __CUDA_ARCH__ >= 350 && __CUDA_ARCH__ < 500
+    #define SCAFFOLDING_KEPLER 1
+  #else
+    #define SCAFFOLDING_KEPLER 0
+  #endif
+
+  /* Pre-Volta: warps execute in lockstep, no independent scheduling */
+  #if __CUDA_ARCH__ < 700
+    #define SCAFFOLDING_LOCKSTEP_WARPS 1
+  #else
+    #define SCAFFOLDING_LOCKSTEP_WARPS 0
+  #endif
+#else
+  #define SCAFFOLDING_K80 0
+  #define SCAFFOLDING_KEPLER 0
+  #define SCAFFOLDING_LOCKSTEP_WARPS 0
+#endif
+
+/* ================================================================
  *  VERSION COMPATIBILITY MACROS
  * ================================================================ */
 
@@ -98,10 +141,45 @@ __device__ inline double atomicAdd_double(double* addr, double val) {
 
 /* ================================================================
  *  BLOCK / GRID SIZING HELPERS
+ *
+ *  K80 (Kepler GK210) tuning notes:
+ *    - 192 cores/SMX in 6 groups of 32 → 6 warp schedulers
+ *    - Max 2048 threads/SM, 16 blocks/SM
+ *    - 48 KB shared memory preferred (set via cudaFuncSetCacheConfig)
+ *    - 128-thread blocks give 16 blocks/SM = 2048 threads → 100% occupancy
+ *      while keeping register pressure low
+ *    - 256-thread blocks give 8 blocks/SM → 100% occupancy, fewer blocks
+ *      to schedule which can reduce overhead on simpler kernels
+ *    - For bandwidth-bound element-wise ops, 128 threads often wins
+ *      due to better L1/texture cache utilization per block
  * ================================================================ */
 
-/* Default block size for 1D kernels */
-#define BLOCK_1D 256
+/* Default block size for 1D kernels — tuned per architecture */
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+  /* K80/Kepler: 128 threads × 16 blocks = 2048 threads = full SM occupancy.
+   * Smaller blocks → more blocks → hide latency better on 6 warp schedulers.
+   * Also reduces register pressure per block → higher occupancy. */
+  #define BLOCK_1D 128
+  /* Max grid blocks: K80 has 13 SMXs, cap to avoid over-subscription */
+  #define K80_MAX_GRID 8192
+#else
+  #define BLOCK_1D 256
+  #define K80_MAX_GRID 65535
+#endif
+
+/* Block size specifically for memory-bandwidth-bound kernels (AdamW, etc.) */
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+  #define BLOCK_BW 128   /* bandwidth-bound: more blocks, better latency hiding */
+#else
+  #define BLOCK_BW 256
+#endif
+
+/* Block size for compute-bound kernels (GELU, softmax, etc.) */
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+  #define BLOCK_COMPUTE 256  /* compute-bound: larger blocks amortize overhead */
+#else
+  #define BLOCK_COMPUTE 256
+#endif
 
 /* For 2D tile kernels (e.g. GEMM, softmax) */
 #define TILE_DIM  16
@@ -126,16 +204,27 @@ static inline int _grid_size_impl(int64_t n, int block, int max_blocks) {
 
 /* Allow grid_size(n, block) and grid_size(n, block, max_blocks) */
 #define _GS3(n, block, max) _grid_size_impl((n), (block), (max))
-#define _GS2(n, block)      _grid_size_impl((n), (block), 65535)
+#define _GS2(n, block)      _grid_size_impl((n), (block), K80_MAX_GRID)
 #define _GS_SEL(_1, _2, _3, NAME, ...) NAME
 #define grid_size(...) _GS_SEL(__VA_ARGS__, _GS3, _GS2)(__VA_ARGS__)
 
 /* ================================================================
  *  FAST MATH DEVICE FUNCTIONS
+ *
+ *  K80 notes: __expf() and __fdividef() are hardware-accelerated
+ *  SFU (Special Function Unit) intrinsics on Kepler. Much faster
+ *  than their full-precision counterparts.  Accuracy is ~23-bit
+ *  mantissa, sufficient for DL inference/training.
  * ================================================================ */
 
 __device__ __forceinline__ float fast_sigmoid(float x) {
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+    /* Use SFU intrinsics: __expf for fast exp, __fdividef for fast division.
+     * On K80 the SFU can execute these in ~8 cycles vs ~32 for full precision. */
+    return __fdividef(1.0f, 1.0f + __expf(-x));
+#else
     return 1.0f / (1.0f + expf(-x));
+#endif
 }
 
 __device__ __forceinline__ float fast_tanh(float x) {
