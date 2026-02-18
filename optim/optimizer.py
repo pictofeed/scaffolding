@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 """Optimizer base class and AdamW implementation."""
 from __future__ import annotations
@@ -29,6 +29,9 @@ except ImportError:
 # Try CUDA-accelerated AdamW (fused GPU kernel)
 try:
     from .._cuda_ops import cuda_adamw_step as _cuda_adamw
+    from .._cuda_ops import dev_adamw_step as _dev_adamw
+    from .._cuda_ops import gputensor_from_numpy as _gpu_from_numpy
+    from .._cuda_ops import GpuTensor as _GpuTensor
     _USE_CUDA_ADAM = True
 except ImportError:
     _USE_CUDA_ADAM = False
@@ -102,29 +105,47 @@ class AdamW(Optimizer):
 
                 pid = id(p)
                 if pid not in self.state:
+                    p_data = p._ensure_cpu() if p._data is None else p._data
                     self.state[pid] = {
                         'step': 0,
-                        'm': np.zeros_like(p._data),
-                        'v': np.zeros_like(p._data),
+                        'm': np.zeros_like(p_data),
+                        'v': np.zeros_like(p_data),
                     }
                 st = self.state[pid]
                 st['step'] += 1
                 t = st['step']
                 m, v = st['m'], st['v']
                 grad = p._grad
-                # Ensure grad dtype matches param dtype (autograd may
-                # produce float64 gradients even for float32 params)
-                if grad.dtype != p._data.dtype:
-                    grad = grad.astype(p._data.dtype)
+                # Ensure grad dtype matches param dtype
+                p_dtype = p._data.dtype if p._data is not None else np.float32
+                if grad.dtype != p_dtype:
+                    grad = grad.astype(p_dtype)
 
                 bc1 = 1.0 - beta1 ** t
                 bc2 = 1.0 - beta2 ** t
 
-                if (_USE_CUDA_ADAM and p._data.dtype == np.float32
-                        and hasattr(p, '_device') and p._device._type == 'cuda'):
-                    # Fused CUDA AdamW kernel — single pass over all params
-                    _cuda_adamw(p._data, grad, m, v,
-                                lr, beta1, beta2, eps, wd, t)
+                _is_cuda = hasattr(p, '_device') and p._device._type == 'cuda'
+                _is_f32 = (p._gpu.dtype if p._data is None else p._data.dtype) == np.float32 if _is_cuda else (p._data.dtype == np.float32 if p._data is not None else False)
+
+                if _USE_CUDA_ADAM and _is_f32 and _is_cuda:
+                    # GPU-resident fast path
+                    if p._gpu is not None:
+                        # Ensure optimizer state is on GPU
+                        if 'gpu_m' not in st:
+                            st['gpu_m'] = _gpu_from_numpy(np.ascontiguousarray(m))
+                            st['gpu_v'] = _gpu_from_numpy(np.ascontiguousarray(v))
+                        # Ensure grad is on GPU
+                        if isinstance(grad, np.ndarray):
+                            gpu_grad = _gpu_from_numpy(np.ascontiguousarray(grad))
+                        else:
+                            gpu_grad = _gpu_from_numpy(np.ascontiguousarray(grad))
+                        _dev_adamw(p._gpu, gpu_grad, st['gpu_m'], st['gpu_v'],
+                                   lr, beta1, beta2, eps, wd, bc1, bc2)
+                    else:
+                        # Fused CUDA AdamW kernel — single pass (CPU arrays)
+                        p._ensure_cpu()
+                        _cuda_adamw(p._data, grad, m, v,
+                                    lr, beta1, beta2, eps, wd, bc1, bc2)
                 elif _USE_MPS_ADAM and p._data.dtype == np.float32:
                     # Use Accelerate vDSP vectorized AdamW (fastest)
                     _accel_adamw(p._data, grad, m, v,

@@ -16,10 +16,14 @@ from .. import autograd as _ag
 
 def relu(input: Tensor, inplace: bool = False) -> Tensor:
     if _USE_CUDA and _is_cuda(input._device):
+        if input._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_relu(input._gpu), device=input._device)
+        input._ensure_cpu()
         result_data = _cuops.cuda_relu(input._data)
-    elif _USE_MPS and input._data.dtype == np.float32:
+    elif _USE_MPS and input._ensure_cpu().dtype == np.float32:
         result_data = _mops.accelerate_relu(input._data)
     else:
+        input._ensure_cpu()
         result_data = np.maximum(input._data, 0)
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
@@ -32,11 +36,16 @@ def relu(input: Tensor, inplace: bool = False) -> Tensor:
 
 def silu(input: Tensor) -> Tensor:
     if _USE_CUDA and _is_cuda(input._device):
+        if input._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_silu(input._gpu), device=input._device)
+        input._ensure_cpu()
         result_data = _cuops.cuda_silu(input._data)
         sig_data = None
     elif _USE_MPS:
+        input._ensure_cpu()
         result_data, sig_data = _mops.accelerate_silu_fwd(input._data)
     elif _USE_CYTHON:
+        input._ensure_cpu()
         flat = np.ascontiguousarray(input._data).ravel()
         if flat.dtype == np.float32:
             result_data = _cops.silu_1d_f32(flat).reshape(input._data.shape)
@@ -45,6 +54,7 @@ def silu(input: Tensor) -> Tensor:
             sig_data = 1.0 / (1.0 + np.exp(-input._data))
             result_data = input._data * sig_data
     else:
+        input._ensure_cpu()
         sig_data = 1.0 / (1.0 + np.exp(-input._data))
         result_data = input._data * sig_data
     rg = input._requires_grad and _ag.is_grad_enabled()
@@ -58,10 +68,15 @@ def silu(input: Tensor) -> Tensor:
 
 def gelu(input: Tensor) -> Tensor:
     if _USE_CUDA and _is_cuda(input._device):
+        if input._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_gelu(input._gpu), device=input._device)
+        input._ensure_cpu()
         result_data = _cuops.cuda_gelu(input._data)
     elif _USE_MPS:
+        input._ensure_cpu()
         result_data = _mops.accelerate_gelu(input._data)
     else:
+        input._ensure_cpu()
         x = input._data
         result_data = 0.5 * x * (1 + np.tanh(
             math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3)))
@@ -80,6 +95,7 @@ def sigmoid(input: Tensor) -> Tensor:
 
 def softplus(input: Tensor, beta: float = 1.0,
              threshold: float = 20.0) -> Tensor:
+    input._ensure_cpu()
     x = input._data
     bx = beta * x
     result_data = np.where(bx > threshold, x, np.log(1 + np.exp(bx)) / beta)
@@ -95,7 +111,9 @@ def softplus(input: Tensor, beta: float = 1.0,
 # ──────────────────────── Softmax ─────────────────────────────────────
 
 def softmax(input: Tensor, dim: int = -1, dtype=None) -> Tensor:
-    x = input._data
+    if _USE_CUDA and _is_cuda(input._device) and input._gpu is not None:
+        return Tensor._wrap_gpu(_cuops.dev_softmax(input._gpu, dim), device=input._device)
+    x = input._ensure_cpu() if input._data is None else input._data
     if _USE_CUDA and _is_cuda(input._device):
         s = _cuops.cuda_softmax(x, dim)
     elif _USE_MPS and x.dtype == np.float32:
@@ -128,7 +146,9 @@ def softmax(input: Tensor, dim: int = -1, dtype=None) -> Tensor:
 
 
 def log_softmax(input: Tensor, dim: int = -1) -> Tensor:
-    x = input._data
+    if _USE_CUDA and _is_cuda(input._device) and input._gpu is not None:
+        return Tensor._wrap_gpu(_cuops.dev_log_softmax(input._gpu, dim), device=input._device)
+    x = input._ensure_cpu() if input._data is None else input._data
     if _USE_CUDA and _is_cuda(input._device):
         result_data = _cuops.cuda_log_softmax(x, dim)
     else:
@@ -143,8 +163,13 @@ def log_softmax(input: Tensor, dim: int = -1) -> Tensor:
 def cross_entropy(input: Tensor, target: Tensor,
                   reduction: str = 'mean') -> Tensor:
     """Cross-entropy loss with log-softmax."""
-    x = input._data
-    t = target._data.astype(np.intp)
+    # GPU-resident fast path
+    if _USE_CUDA and _is_cuda(input._device) and input._gpu is not None and target._gpu is not None and reduction == 'mean':
+        loss_val, probs_gpu = _cuops.dev_cross_entropy(input._gpu, target._gpu)
+        return Tensor._wrap(np.float32(loss_val), False, None, input._device)
+
+    x = input._ensure_cpu() if input._data is None else input._data
+    t = (target._ensure_cpu() if target._data is None else target._data).astype(np.intp)
 
     # Reshape to 2D if needed
     if x.ndim == 1:
@@ -208,12 +233,16 @@ def dropout(input: Tensor, p: float = 0.5,
     if not training or p == 0.0:
         return input
     if _USE_CUDA and _is_cuda(input._device):
-        result_data, mask = _cuops.cuda_dropout(input._data, p)
+        if input._gpu is not None:
+            result_gpu, mask_gpu = _cuops.dev_dropout(input._gpu, p)
+            return Tensor._wrap_gpu(result_gpu, device=input._device)
+        result_data, mask = _cuops.cuda_dropout(input._ensure_cpu(), p)
         mask = mask.astype(input._data.dtype) / (1.0 - p)
     else:
-        mask = (np.random.rand(*input._data.shape) > p).astype(input._data.dtype)
+        x = input._ensure_cpu()
+        mask = (np.random.rand(*x.shape) > p).astype(x.dtype)
         scale = 1.0 / (1.0 - p)
-        result_data = input._data * mask * scale
+        result_data = x * mask * scale
         mask = mask * scale
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
@@ -229,6 +258,7 @@ def dropout(input: Tensor, p: float = 0.5,
 def pad(input: Tensor, pad_widths, mode: str = 'constant',
         value: float = 0.0) -> Tensor:
     """Pad tensor. pad_widths is PyTorch-style: (left, right, ...) from last dim."""
+    input._ensure_cpu()
     ndim = input._data.ndim
     # Convert PyTorch padding format to numpy
     pairs = []
@@ -263,6 +293,9 @@ def scaled_dot_product_attention(
         dropout_p: float = 0.0,
         scale: float | None = None) -> Tensor:
     """Scaled dot-product attention (manual)."""
+    q._ensure_cpu()
+    k._ensure_cpu()
+    v._ensure_cpu()
     d = q._data.shape[-1]
     if scale is None:
         scale = 1.0 / math.sqrt(d)
@@ -317,13 +350,22 @@ def scaled_dot_product_attention(
 def linear(input: Tensor, weight: Tensor,
            bias: Tensor | None = None) -> Tensor:
     if _USE_CUDA and _is_cuda(input._device):
+        if input._gpu is not None and weight._gpu is not None:
+            gt_bias = bias._gpu if (bias is not None and bias._gpu is not None) else None
+            return Tensor._wrap_gpu(
+                _cuops.dev_linear_forward(input._gpu, weight._gpu, gt_bias),
+                device=input._device)
         result_data = _cuops.cuda_linear_forward(
-            input._data, weight._data,
-            bias._data if bias is not None else None
+            input._ensure_cpu() if input._data is None else input._data,
+            weight._ensure_cpu() if weight._data is None else weight._data,
+            (bias._ensure_cpu() if bias._data is None else bias._data) if bias is not None else None
         )
     else:
+        input._ensure_cpu()
+        weight._ensure_cpu()
         result_data = np.matmul(input._data, weight._data.T)
         if bias is not None:
+            bias._ensure_cpu()
             result_data = result_data + bias._data
     rg = (input._requires_grad or weight._requires_grad) and _ag.is_grad_enabled()
     return Tensor._wrap(result_data, rg, None, input._device)

@@ -17,7 +17,7 @@ class Parameter(Tensor):
         if data is None:
             data = Tensor(np.empty(0, dtype=np.float32))
         if isinstance(data, Tensor):
-            super().__init__(data._data.copy(), requires_grad=requires_grad)
+            super().__init__(data._ensure_cpu().copy(), requires_grad=requires_grad)
         elif isinstance(data, np.ndarray):
             super().__init__(data.copy(), requires_grad=requires_grad)
         else:

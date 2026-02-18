@@ -34,12 +34,30 @@ class Linear(Module):
             self.bias = None  # type: ignore[assignment]
 
     def forward(self, x: Tensor) -> Tensor:
+        # GPU-resident fast path
+        if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            # Ensure weight is on GPU
+            if self.weight._gpu is None and self.weight._data is not None:
+                self.weight._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(self.weight._data))
+            if self.weight._gpu is not None:
+                gt_bias = None
+                has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+                if has_bias:
+                    if self.bias._gpu is None and self.bias._data is not None:
+                        self.bias._gpu = _cuops.gputensor_from_numpy(
+                            np.ascontiguousarray(self.bias._data))
+                    gt_bias = self.bias._gpu
+                return Tensor._wrap_gpu(
+                    _cuops.dev_linear_forward(x._gpu, self.weight._gpu, gt_bias),
+                    device=x._device)
+
         # Use BLAS sgemm_nt to avoid transposing weight
         w_data = self.weight._data
         if _USE_CUDA and _is_cuda(x._device):
             has_bias = self.bias is not None and isinstance(self.bias, Parameter)
             result_data = _cuops.cuda_linear_forward(
-                x._data, w_data,
+                x._ensure_cpu() if x._data is None else x._data, w_data,
                 self.bias._data if has_bias else None
             )
         elif _USE_MPS and x._data.dtype == np.float32 and w_data.dtype == np.float32:
@@ -87,7 +105,18 @@ class Embedding(Module):
         self.weight = Parameter(Tensor(w))
 
     def forward(self, indices: Tensor) -> Tensor:
-        idx = indices._data
+        # GPU-resident fast path
+        if _USE_CUDA and _is_cuda(indices._device) and indices._gpu is not None:
+            if self.weight._gpu is None and self.weight._data is not None:
+                self.weight._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(self.weight._data))
+            if self.weight._gpu is not None:
+                return Tensor._wrap_gpu(
+                    _cuops.dev_embedding(self.weight._gpu, indices._gpu,
+                                         self.embedding_dim),
+                    device=indices._device)
+
+        idx = indices._ensure_cpu() if indices._data is None else indices._data
         if idx.dtype != np.intp:
             idx = idx.astype(np.intp)
         if _USE_CUDA and _is_cuda(indices._device):
@@ -143,6 +172,7 @@ class Conv1d(Module):
         
         Uses vectorized im2col approach instead of Python loops.
         """
+        x._ensure_cpu()
         B, C_in, L = x._data.shape
         K = self.kernel_size
         P = self.padding
@@ -239,6 +269,11 @@ class Dropout(Module):
     def forward(self, x: Tensor) -> Tensor:
         if not self._training or self.p == 0.0:
             return x
+        # GPU-resident fast path via functional
+        if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            from . import functional as F
+            return F.dropout(x, self.p, True)
+        x._ensure_cpu()
         mask = (np.random.rand(*x._data.shape) > self.p).astype(x._data.dtype)
         scale = 1.0 / (1.0 - self.p)
         result_data = x._data * mask * scale
@@ -262,10 +297,15 @@ class SiLU(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if _USE_CUDA and _is_cuda(x._device):
+            if x._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_silu(x._gpu), device=x._device)
+            x._ensure_cpu()
             result_data = _cuops.cuda_silu(x._data)
         elif _USE_MPS:
+            x._ensure_cpu()
             result_data = _mops.accelerate_silu(x._data)
         elif _USE_CYTHON:
+            x._ensure_cpu()
             flat = np.ascontiguousarray(x._data).ravel()
             if flat.dtype == np.float32:
                 result_data = _cops.silu_1d_f32(flat).reshape(x._data.shape)
@@ -273,6 +313,7 @@ class SiLU(Module):
                 sig = 1.0 / (1.0 + np.exp(-x._data))
                 result_data = x._data * sig
         else:
+            x._ensure_cpu()
             sig = 1.0 / (1.0 + np.exp(-x._data))
             result_data = x._data * sig
         rg = x._requires_grad and _ag.is_grad_enabled()
@@ -292,8 +333,12 @@ class ReLU(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if _USE_CUDA and _is_cuda(x._device):
+            if x._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_relu(x._gpu), device=x._device)
+            x._ensure_cpu()
             result_data = _cuops.cuda_relu(x._data)
         else:
+            x._ensure_cpu()
             result_data = np.maximum(x._data, 0)
         rg = x._requires_grad and _ag.is_grad_enabled()
         grad_fn = None
@@ -309,10 +354,15 @@ class GELU(Module):
 
     def forward(self, x: Tensor) -> Tensor:
         if _USE_CUDA and _is_cuda(x._device):
+            if x._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_gelu(x._gpu), device=x._device)
+            x._ensure_cpu()
             result_data = _cuops.cuda_gelu(x._data)
         elif _USE_MPS:
+            x._ensure_cpu()
             result_data = _mops.accelerate_gelu(x._data)
         else:
+            x._ensure_cpu()
             result_data = 0.5 * x._data * (1 + np.tanh(
                 math.sqrt(2.0 / math.pi) * (x._data + 0.044715 * x._data ** 3)))
         return Tensor._wrap(result_data, x._requires_grad, None, x._device)
@@ -346,18 +396,41 @@ class LayerNorm(Module):
             self.bias = None
 
     def forward(self, x: Tensor) -> Tensor:
-        # CUDA fast-path
+        # CUDA fast-path (GPU-resident)
+        if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            if self.weight is not None and self.weight._gpu is None:
+                self.weight._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(self.weight._data))
+            if self.bias is not None and self.bias._gpu is None:
+                self.bias._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(self.bias._data))
+            # Reshape to 2D for kernel
+            orig_shape = x._gpu.shape
+            D = self.normalized_shape[-1]
+            N = x._gpu.numel // D
+            # Need to reshape the GpuTensor
+            from scaffolding._cuda_ops import GpuTensor
+            x_2d = GpuTensor(x._gpu.buffer, (N, D), x._gpu.dtype)
+            gt_gamma = self.weight._gpu if self.weight is not None else None
+            gt_beta = self.bias._gpu if self.bias is not None else None
+            y_2d = _cuops.dev_layer_norm(x_2d, gt_gamma, gt_beta, self.eps)
+            y_out = GpuTensor(y_2d.buffer, orig_shape, y_2d.dtype)
+            return Tensor._wrap_gpu(y_out, x._requires_grad, None, x._device)
+
+        # CUDA fallback (CPU arrays)
         if _USE_CUDA and _is_cuda(x._device):
             gamma = self.weight._data if self.weight is not None else None
             beta = self.bias._data if self.bias is not None else None
+            xd = x._ensure_cpu() if x._data is None else x._data
             y = _cuops.cuda_layer_norm(
-                x._data.reshape(-1, self.normalized_shape[-1]),
+                xd.reshape(-1, self.normalized_shape[-1]),
                 gamma, beta, self.eps,
             )
-            return Tensor._wrap(y.reshape(x._data.shape),
+            return Tensor._wrap(y.reshape(xd.shape),
                                 x._requires_grad, None, x._device)
 
         # Generic NumPy path
+        x._ensure_cpu()
         axes = tuple(range(-len(self.normalized_shape), 0))
         mean = np.mean(x._data, axis=axes, keepdims=True)
         var = np.var(x._data, axis=axes, keepdims=True)
@@ -388,17 +461,33 @@ class RMSNorm(Module):
                                                dtype=np.float32)))
 
     def forward(self, x: Tensor) -> Tensor:
-        # CUDA fast-path
+        # CUDA fast-path (GPU-resident)
+        if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            if self.weight._gpu is None:
+                self.weight._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(self.weight._data))
+            orig_shape = x._gpu.shape
+            D = self.normalized_shape[-1]
+            N = x._gpu.numel // D
+            from scaffolding._cuda_ops import GpuTensor
+            x_2d = GpuTensor(x._gpu.buffer, (N, D), x._gpu.dtype)
+            y_2d = _cuops.dev_rms_norm(x_2d, self.weight._gpu, self.eps)
+            y_out = GpuTensor(y_2d.buffer, orig_shape, y_2d.dtype)
+            return Tensor._wrap_gpu(y_out, x._requires_grad, None, x._device)
+
+        # CUDA fallback
         if _USE_CUDA and _is_cuda(x._device):
             gamma = self.weight._data
+            xd = x._ensure_cpu() if x._data is None else x._data
             y = _cuops.cuda_rms_norm(
-                x._data.reshape(-1, self.normalized_shape[-1]),
+                xd.reshape(-1, self.normalized_shape[-1]),
                 gamma, self.eps,
             )
-            return Tensor._wrap(y.reshape(x._data.shape),
+            return Tensor._wrap(y.reshape(xd.shape),
                                 x._requires_grad, None, x._device)
 
         # Generic NumPy path
+        x._ensure_cpu()
         axes = tuple(range(-len(self.normalized_shape), 0))
         rms = np.sqrt(np.mean(x._data ** 2, axis=axes, keepdims=True) + self.eps)
         x_norm = x._data / rms * self.weight._data

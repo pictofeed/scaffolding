@@ -489,21 +489,21 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
             def forward(self, x):
                 h = self.ln1(x)
                 qkv = self.attn_qkv(h)
-                qkv_data = qkv._data.reshape(B_f, S_f, 3, 8, D_f // 8)
-                q = sf.tensor(qkv_data[:, :, 0].transpose(0, 2, 1, 3), device='cuda')
-                k = sf.tensor(qkv_data[:, :, 1].transpose(0, 2, 1, 3), device='cuda')
-                v = sf.tensor(qkv_data[:, :, 2].transpose(0, 2, 1, 3), device='cuda')
+                # Attention head reshape requires CPU roundtrip for permute
+                qkv_r = qkv.reshape(B_f, S_f, 3, 8, D_f // 8)
+                q = qkv_r[:, :, 0].permute(0, 2, 1, 3).contiguous().to('cuda')
+                k = qkv_r[:, :, 1].permute(0, 2, 1, 3).contiguous().to('cuda')
+                v = qkv_r[:, :, 2].permute(0, 2, 1, 3).contiguous().to('cuda')
                 scale = (D_f // 8) ** -0.5
                 attn_w = sf_F.softmax(q.matmul(k.transpose(-2, -1)) * scale, dim=-1)
                 attn_out = attn_w.matmul(v)
-                attn_out_data = attn_out._data.transpose(0, 2, 1, 3).reshape(
-                    B_f, S_f, D_f)
-                x_data = x._data + self.attn_out(
-                    sf.tensor(attn_out_data, device='cuda'))._data
-                x = sf.tensor(x_data, device='cuda')
+                # Merge heads back
+                attn_out = attn_out.permute(0, 2, 1, 3).contiguous().reshape(
+                    B_f, S_f, D_f).to('cuda')
+                x = x + self.attn_out(attn_out)
                 h2 = self.ln2(x)
                 ff_out = self.ff2(sf_F.silu(self.ff1(h2)))
-                return sf.tensor(x._data + ff_out._data, device='cuda')
+                return x + ff_out
 
         sf_block = SfBlock()
         sf_block.eval()

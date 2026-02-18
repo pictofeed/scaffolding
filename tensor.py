@@ -61,7 +61,7 @@ class Tensor:
 
     __slots__ = (
         '_data', '_requires_grad', '_grad', '_grad_fn', '_device',
-        '_version', '_grad_out',
+        '_version', '_grad_out', '_gpu',
     )
 
     # ------------------------------------------------------------------ #
@@ -76,7 +76,7 @@ class Tensor:
         requires_grad: bool = False,
     ):
         if isinstance(data, Tensor):
-            arr = data._data.copy()
+            arr = data._ensure_cpu().copy()
         elif isinstance(data, np.ndarray):
             arr = data
         else:
@@ -94,6 +94,10 @@ class Tensor:
         self._grad_fn: _ag.GradFn | None = None
         self._device: Device = Device(device) if device is not None else _CPU_DEVICE
         self._version: int = 0
+        self._gpu = None
+        # Upload to GPU if CUDA device (float32 and int64)
+        if _USE_CUDA and _is_cuda(self._device) and arr.dtype in (np.float32, np.int64):
+            self._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr))
 
     # ------------------------------------------------------------------ #
     #  Properties                                                        #
@@ -103,6 +107,7 @@ class Tensor:
     def data(self) -> 'Tensor':
         t = Tensor.__new__(Tensor)
         t._data = self._data
+        t._gpu = self._gpu
         t._requires_grad = False
         t._grad = None
         t._grad_fn = None
@@ -114,10 +119,13 @@ class Tensor:
     def data(self, value: 'Tensor'):
         if isinstance(value, Tensor):
             self._data = value._data
+            self._gpu = value._gpu
         elif isinstance(value, np.ndarray):
             self._data = value
+            self._gpu = None
         else:
             self._data = np.asarray(value)
+            self._gpu = None
 
     @property
     def grad(self) -> 'Tensor | None':
@@ -129,6 +137,7 @@ class Tensor:
         t._grad = None
         t._grad_fn = None
         t._device = self._device
+        t._gpu = None
         t._version = 0
         return t
 
@@ -137,7 +146,7 @@ class Tensor:
         if value is None:
             self._grad = None
         elif isinstance(value, Tensor):
-            self._grad = value._data
+            self._grad = value._ensure_cpu()
         else:
             self._grad = np.asarray(value)
 
@@ -155,15 +164,27 @@ class Tensor:
 
     @property
     def shape(self) -> tuple:
-        return self._data.shape
+        if self._data is not None:
+            return self._data.shape
+        if self._gpu is not None:
+            return self._gpu.shape
+        return ()
 
     @property
     def ndim(self) -> int:
-        return self._data.ndim
+        if self._data is not None:
+            return self._data.ndim
+        if self._gpu is not None:
+            return len(self._gpu.shape)
+        return 0
 
     @property
     def dtype(self) -> Dtype:
-        return Dtype.from_numpy(self._data.dtype)
+        if self._data is not None:
+            return Dtype.from_numpy(self._data.dtype)
+        if self._gpu is not None:
+            return Dtype.from_numpy(self._gpu.dtype)
+        return Dtype.from_numpy(np.float32)
 
     @property
     def device(self) -> Device:
@@ -178,20 +199,27 @@ class Tensor:
     # ------------------------------------------------------------------ #
 
     def size(self, dim: int | None = None):
+        s = self.shape
         if dim is not None:
-            return self._data.shape[dim]
-        return self._data.shape
+            return s[dim]
+        return s
 
     def dim(self) -> int:
-        return self._data.ndim
+        return self.ndim
 
     def numel(self) -> int:
-        return self._data.size
+        if self._data is not None:
+            return self._data.size
+        if self._gpu is not None:
+            return self._gpu.numel
+        return 0
 
     def item(self) -> float | int:
+        self._ensure_cpu()
         return self._data.item()
 
     def data_ptr(self) -> int:
+        self._ensure_cpu()
         return self._data.ctypes.data
 
     def type(self, dtype_str: str | None = None):
@@ -200,9 +228,10 @@ class Tensor:
         return self
 
     def __len__(self) -> int:
-        return self._data.shape[0]
+        return self.shape[0]
 
     def __repr__(self) -> str:
+        self._ensure_cpu()
         data_str = repr(self._data)
         prefix = "tensor("
         suffix = ")"
@@ -213,12 +242,15 @@ class Tensor:
         return prefix + data_str + suffix
 
     def __bool__(self) -> bool:
+        self._ensure_cpu()
         return bool(self._data)
 
     def __int__(self) -> int:
+        self._ensure_cpu()
         return int(self._data)
 
     def __float__(self) -> float:
+        self._ensure_cpu()
         return float(self._data)
 
     # ------------------------------------------------------------------ #
@@ -236,7 +268,29 @@ class Tensor:
         t._grad_fn = grad_fn
         t._device = device if device is not None else _CPU_DEVICE
         t._version = 0
+        t._gpu = None
         return t
+
+    @staticmethod
+    def _wrap_gpu(gpu, requires_grad: bool = False,
+                  grad_fn: _ag.GradFn | None = None,
+                  device: Device | None = None) -> 'Tensor':
+        """Create a Tensor backed by a GpuTensor (no CPU data until needed)."""
+        t = Tensor.__new__(Tensor)
+        t._data = None
+        t._gpu = gpu
+        t._requires_grad = requires_grad
+        t._grad = None
+        t._grad_fn = grad_fn
+        t._device = device if device is not None else _CPU_DEVICE
+        t._version = 0
+        return t
+
+    def _ensure_cpu(self):
+        """Ensure _data is populated (download from GPU if needed)."""
+        if self._data is None and self._gpu is not None:
+            self._data = _cuops.gputensor_to_numpy(self._gpu)
+        return self._data
 
     def _needs_grad(self, *others: 'Tensor') -> bool:
         if not _ag.is_grad_enabled():
@@ -253,6 +307,16 @@ class Tensor:
     # ------------------------------------------------------------------ #
 
     def __add__(self, other):
+        # GPU-resident fast path
+        if self._gpu is not None:
+            if isinstance(other, (int, float)):
+                return Tensor._wrap_gpu(_cuops.dev_adds(self._gpu, float(other)),
+                                        device=self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            if b._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_add(self._gpu, b._gpu),
+                                        device=self._device)
+        self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data + other
             rg = self._requires_grad and _ag.is_grad_enabled()
@@ -263,6 +327,7 @@ class Tensor:
                 return Tensor._wrap(result_data, True, grad_fn, self._device)
             return Tensor._wrap(result_data, False, None, self._device)
         b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+        b._ensure_cpu()
         result_data = self._data + b._data
         rg = self._needs_grad(b)
         grad_fn = None
@@ -275,6 +340,16 @@ class Tensor:
         return self.__add__(other)
 
     def __sub__(self, other):
+        # GPU-resident fast path
+        if self._gpu is not None:
+            if isinstance(other, (int, float)):
+                return Tensor._wrap_gpu(_cuops.dev_adds(self._gpu, -float(other)),
+                                        device=self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            if b._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_sub(self._gpu, b._gpu),
+                                        device=self._device)
+        self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data - other
             rg = self._requires_grad and _ag.is_grad_enabled()
@@ -285,6 +360,7 @@ class Tensor:
                 return Tensor._wrap(result_data, True, grad_fn, self._device)
             return Tensor._wrap(result_data, False, None, self._device)
         b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+        b._ensure_cpu()
         result_data = self._data - b._data
         rg = self._needs_grad(b)
         grad_fn = None
@@ -298,6 +374,16 @@ class Tensor:
         return b.__sub__(self)
 
     def __mul__(self, other):
+        # GPU-resident fast path
+        if self._gpu is not None:
+            if isinstance(other, (int, float)):
+                return Tensor._wrap_gpu(_cuops.dev_muls(self._gpu, float(other)),
+                                        device=self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            if b._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_mul(self._gpu, b._gpu),
+                                        device=self._device)
+        self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data * other
             rg = self._requires_grad and _ag.is_grad_enabled()
@@ -309,6 +395,7 @@ class Tensor:
                 return Tensor._wrap(result_data, True, grad_fn, self._device)
             return Tensor._wrap(result_data, False, None, self._device)
         b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+        b._ensure_cpu()
         result_data = self._data * b._data
         rg = self._needs_grad(b)
         grad_fn = None
@@ -322,6 +409,16 @@ class Tensor:
         return self.__mul__(other)
 
     def __truediv__(self, other):
+        # GPU-resident fast path
+        if self._gpu is not None:
+            if isinstance(other, (int, float)):
+                return Tensor._wrap_gpu(_cuops.dev_muls(self._gpu, 1.0 / float(other)),
+                                        device=self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            if b._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_div(self._gpu, b._gpu),
+                                        device=self._device)
+        self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data / other
             rg = self._requires_grad and _ag.is_grad_enabled()
@@ -333,6 +430,7 @@ class Tensor:
                 return Tensor._wrap(result_data, True, grad_fn, self._device)
             return Tensor._wrap(result_data, False, None, self._device)
         b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+        b._ensure_cpu()
         result_data = self._data / b._data
         rg = self._needs_grad(b)
         grad_fn = None
@@ -347,6 +445,10 @@ class Tensor:
         return b.__truediv__(self)
 
     def __neg__(self):
+        # GPU-resident fast path
+        if self._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_neg(self._gpu), device=self._device)
+        self._ensure_cpu()
         result_data = -self._data
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -356,7 +458,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def __pow__(self, other):
+        self._ensure_cpu()
         if isinstance(other, Tensor):
+            other._ensure_cpu()
             exp_val = other._data
         else:
             exp_val = other
@@ -375,42 +479,59 @@ class Tensor:
 
     # Comparison operators
     def __gt__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data > b._data, device=self._device)
 
     def __ge__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data >= b._data, device=self._device)
 
     def __lt__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data < b._data, device=self._device)
 
     def __le__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data <= b._data, device=self._device)
 
     def __eq__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data == b._data, device=self._device)
 
     def __ne__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data != b._data, device=self._device)
 
     def __invert__(self):
+        self._ensure_cpu()
         return Tensor._wrap(~self._data, device=self._device)
 
     def __and__(self, other):
+        self._ensure_cpu()
         b = _ensure_tensor(other)
+        b._ensure_cpu()
         return Tensor._wrap(self._data & b._data, device=self._device)
 
     # Indexing
     def __getitem__(self, key):
+        self._ensure_cpu()
         if isinstance(key, Tensor):
+            key._ensure_cpu()
             key = key._data
         elif isinstance(key, tuple):
-            key = tuple(k._data if isinstance(k, Tensor) else k for k in key)
+            key = tuple((k._ensure_cpu() if isinstance(k, Tensor) else k) for k in key)
         result_data = self._data[key]
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -421,9 +542,12 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def __setitem__(self, key, value):
+        self._ensure_cpu()
         if isinstance(key, Tensor):
+            key._ensure_cpu()
             key = key._data
         if isinstance(value, Tensor):
+            value._ensure_cpu()
             value = value._data
         self._data[key] = value
         self._version += 1
@@ -440,12 +564,18 @@ class Tensor:
 
     def exp(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_exp(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_exp(self._data)
         elif _USE_MPS:
+            self._ensure_cpu()
             result_data = _mops.accelerate_exp(self._data)
         elif _USE_CYTHON:
+            self._ensure_cpu()
             result_data = _cops.exp_forward(self._data)
         else:
+            self._ensure_cpu()
             result_data = np.exp(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -457,10 +587,15 @@ class Tensor:
 
     def log(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_log(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_log(self._data)
         elif _USE_MPS:
+            self._ensure_cpu()
             result_data = _mops.accelerate_log(self._data)
         else:
+            self._ensure_cpu()
             result_data = np.log(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -472,10 +607,15 @@ class Tensor:
 
     def sqrt(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_sqrt(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_sqrt(self._data)
         elif _USE_MPS:
+            self._ensure_cpu()
             result_data = _mops.accelerate_sqrt(self._data)
         else:
+            self._ensure_cpu()
             result_data = np.sqrt(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -487,10 +627,15 @@ class Tensor:
 
     def rsqrt(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_rsqrt(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_rsqrt(self._data)
         elif _USE_MPS:
+            self._ensure_cpu()
             result_data = _mops.accelerate_rsqrt(self._data)
         else:
+            self._ensure_cpu()
             result_data = 1.0 / np.sqrt(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -502,12 +647,18 @@ class Tensor:
 
     def sigmoid(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_sigmoid(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_sigmoid(self._data)
         elif _USE_MPS:
+            self._ensure_cpu()
             result_data = _mops.accelerate_sigmoid(self._data)
         elif _USE_CYTHON:
+            self._ensure_cpu()
             result_data = _cops.sigmoid_forward(self._data)
         else:
+            self._ensure_cpu()
             # Numerically stable sigmoid using np.clip to avoid overflow
             x = np.clip(self._data, -88.0, 88.0)
             result_data = 1.0 / (1.0 + np.exp(-x))
@@ -521,8 +672,12 @@ class Tensor:
 
     def sin(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_sin(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_sin(self._data)
         else:
+            self._ensure_cpu()
             result_data = np.sin(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -534,8 +689,12 @@ class Tensor:
 
     def cos(self) -> 'Tensor':
         if _USE_CUDA and _is_cuda(self._device):
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_cos(self._gpu), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_cos(self._data)
         else:
+            self._ensure_cpu()
             result_data = np.cos(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -549,8 +708,12 @@ class Tensor:
         if _USE_CUDA and _is_cuda(self._device):
             lo = min if min is not None else -3.4e38
             hi = max if max is not None else 3.4e38
+            if self._gpu is not None:
+                return Tensor._wrap_gpu(_cuops.dev_clamp(self._gpu, lo, hi), device=self._device)
+            self._ensure_cpu()
             result_data = _cuops.cuda_clamp(self._data, lo, hi)
         else:
+            self._ensure_cpu()
             result_data = np.clip(self._data, min, max)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -563,6 +726,7 @@ class Tensor:
     # ---- Reduction methods ----
 
     def sum(self, dim=None, keepdim=False) -> 'Tensor':
+        self._ensure_cpu()
         result_data = np.sum(self._data, axis=dim, keepdims=keepdim)
         if isinstance(result_data, np.generic):
             result_data = np.array(result_data)
@@ -579,6 +743,7 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def mean(self, dim=None, keepdim=False) -> 'Tensor':
+        self._ensure_cpu()
         result_data = np.mean(self._data, axis=dim, keepdims=keepdim)
         if isinstance(result_data, np.generic):
             result_data = np.array(result_data)
@@ -595,6 +760,7 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def nonzero(self, as_tuple=False):
+        self._ensure_cpu()
         indices = np.nonzero(self._data)
         if as_tuple:
             return tuple(Tensor._wrap(np.asarray(idx), device=self._device) for idx in indices)
@@ -605,6 +771,23 @@ class Tensor:
     def reshape(self, *shape) -> 'Tensor':
         if len(shape) == 1 and isinstance(shape[0], (tuple, list)):
             shape = tuple(shape[0])
+        # GPU-resident fast path: metadata-only reshape (zero copy)
+        if self._gpu is not None:
+            # Resolve -1 dim
+            known = 1
+            neg_idx = -1
+            shape = list(shape)
+            for i, s in enumerate(shape):
+                if s == -1:
+                    neg_idx = i
+                else:
+                    known *= s
+            if neg_idx >= 0:
+                shape[neg_idx] = self._gpu.numel // known
+            shape = tuple(shape)
+            from _cuda_ops import GpuTensor
+            gt = GpuTensor(self._gpu.buffer, shape, self._gpu.dtype)
+            return Tensor._wrap_gpu(gt, device=self._device)
         result_data = self._data.reshape(shape)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -618,6 +801,7 @@ class Tensor:
         return self.reshape(*shape)
 
     def transpose(self, dim0: int, dim1: int) -> 'Tensor':
+        self._ensure_cpu()
         result_data = np.swapaxes(self._data, dim0, dim1)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -630,6 +814,7 @@ class Tensor:
     def permute(self, *dims) -> 'Tensor':
         if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
             dims = tuple(dims[0])
+        self._ensure_cpu()
         result_data = np.transpose(self._data, dims)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -640,6 +825,7 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def unsqueeze(self, dim: int) -> 'Tensor':
+        self._ensure_cpu()
         result_data = np.expand_dims(self._data, axis=dim)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
@@ -650,6 +836,7 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def squeeze(self, dim: int | None = None) -> 'Tensor':
+        self._ensure_cpu()
         if dim is not None:
             result_data = np.squeeze(self._data, axis=dim)
         else:
@@ -663,12 +850,14 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def contiguous(self) -> 'Tensor':
+        self._ensure_cpu()
         if self._data.flags.c_contiguous:
             return self
         return Tensor._wrap(np.ascontiguousarray(self._data),
                             self._requires_grad, self._grad_fn, self._device)
 
     def chunk(self, chunks: int, dim: int = 0) -> tuple['Tensor', ...]:
+        self._ensure_cpu()
         arrays = np.array_split(self._data, chunks, axis=dim)
         results = []
         for arr in arrays:
@@ -677,44 +866,51 @@ class Tensor:
         return tuple(results)
 
     def split(self, split_size: int, dim: int = 0) -> tuple['Tensor', ...]:
-        n = self._data.shape[dim]
+        n = self.shape[dim]
         chunks = math.ceil(n / split_size)
         return self.chunk(chunks, dim)
 
     def flatten(self, start_dim: int = 0, end_dim: int = -1) -> 'Tensor':
-        shape = self._data.shape
+        shape = self.shape
         if end_dim < 0:
             end_dim += len(shape)
         new_shape = shape[:start_dim] + (-1,) + shape[end_dim + 1:]
         return self.reshape(*new_shape)
 
     def expand(self, *sizes) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(np.broadcast_to(self._data, sizes).copy(),
                             self._requires_grad, None, self._device)
 
     def repeat(self, *sizes) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(np.tile(self._data, sizes),
                             self._requires_grad, None, self._device)
 
     # ---- Type / device conversion ----
 
     def float(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.astype(np.float32),
                             self._requires_grad, None, self._device)
 
     def half(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.astype(np.float16),
                             self._requires_grad, None, self._device)
 
     def long(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.astype(np.int64),
                             self._requires_grad, None, self._device)
 
     def int(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.astype(np.int32),
                             self._requires_grad, None, self._device)
 
     def bool(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.astype(np.bool_),
                             self._requires_grad, None, self._device)
 
@@ -740,13 +936,16 @@ class Tensor:
         if 'device' in kwargs:
             new_device = Device(kwargs['device'])
 
-        arr = self._data
+        arr = self._ensure_cpu()
         if new_dtype is not None:
             if isinstance(new_dtype, Dtype):
                 arr = arr.astype(new_dtype.to_numpy())
             else:
                 arr = arr.astype(new_dtype)
         t = Tensor._wrap(arr.copy(), self._requires_grad, None, new_device)
+        # Upload to GPU if moving to CUDA
+        if _USE_CUDA and _is_cuda(new_device) and t._data.dtype in (np.float32, np.int64):
+            t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data))
         return t
 
     def cpu(self) -> 'Tensor':
@@ -762,15 +961,19 @@ class Tensor:
         return self.to('mps')
 
     def numpy(self) -> np.ndarray:
+        self._ensure_cpu()
         return self._data.copy()
 
     def tolist(self):
+        self._ensure_cpu()
         return self._data.tolist()
 
     # ---- In-place operations ----
 
     def mul_(self, other) -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(other, Tensor):
+            other._ensure_cpu()
             self._data *= other._data
         else:
             self._data *= other
@@ -778,7 +981,9 @@ class Tensor:
         return self
 
     def add_(self, other, alpha: float = 1.0) -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(other, Tensor):
+            other._ensure_cpu()
             self._data += alpha * other._data
         else:
             self._data += alpha * other
@@ -786,7 +991,9 @@ class Tensor:
         return self
 
     def sub_(self, other) -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(other, Tensor):
+            other._ensure_cpu()
             self._data -= other._data
         else:
             self._data -= other
@@ -794,7 +1001,9 @@ class Tensor:
         return self
 
     def div_(self, other) -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(other, Tensor):
+            other._ensure_cpu()
             self._data /= other._data
         else:
             self._data /= other
@@ -802,7 +1011,9 @@ class Tensor:
         return self
 
     def copy_(self, src: 'Tensor') -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(src, Tensor):
+            src._ensure_cpu()
             np.copyto(self._data, src._data)
         else:
             np.copyto(self._data, src)
@@ -810,16 +1021,19 @@ class Tensor:
         return self
 
     def zero_(self) -> 'Tensor':
+        self._ensure_cpu()
         self._data.fill(0)
         self._version += 1
         return self
 
     def fill_(self, value) -> 'Tensor':
+        self._ensure_cpu()
         self._data.fill(value)
         self._version += 1
         return self
 
     def clamp_(self, min=None, max=None) -> 'Tensor':
+        self._ensure_cpu()
         if min is not None:
             np.maximum(self._data, min, out=self._data)
         if max is not None:
@@ -836,6 +1050,7 @@ class Tensor:
         _ag.backward(self, gradient)
 
     def detach(self) -> 'Tensor':
+        self._ensure_cpu()
         t = Tensor._wrap(self._data, False, None, self._device)
         return t
 
@@ -849,10 +1064,12 @@ class Tensor:
     # ---- Misc ----
 
     def clone(self) -> 'Tensor':
+        self._ensure_cpu()
         return Tensor._wrap(self._data.copy(), self._requires_grad,
                             None, self._device)
 
     def astype(self, dtype) -> 'Tensor':
+        self._ensure_cpu()
         if isinstance(dtype, Dtype):
             return Tensor._wrap(self._data.astype(dtype.to_numpy()),
                                 self._requires_grad, None, self._device)
@@ -880,6 +1097,14 @@ def _resolve_device(device) -> Device:
     return Device(device)
 
 
+def _make_tensor(arr: np.ndarray, requires_grad: bool, device: Device) -> Tensor:
+    """Create a Tensor, auto-uploading to GPU if device is CUDA."""
+    t = Tensor._wrap(arr, requires_grad, None, device)
+    if _USE_CUDA and _is_cuda(device) and arr.dtype in (np.float32, np.int64):
+        t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr))
+    return t
+
+
 def tensor(data, dtype=None, device=None, requires_grad=False) -> Tensor:
     return Tensor(data, dtype=dtype, device=device, requires_grad=requires_grad)
 
@@ -889,14 +1114,14 @@ def zeros(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.zeros(size, dtype=dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def zeros_like(input: Tensor, dtype=None, device=None) -> Tensor:
-    dt = _resolve_dtype(dtype) or input._data.dtype
-    arr = np.zeros_like(input._data, dtype=dt)
+    dt = _resolve_dtype(dtype) or input._ensure_cpu().dtype
+    arr = np.zeros(input.shape, dtype=dt)
     dev = _resolve_device(device) if device else input._device
-    return Tensor._wrap(arr, False, None, dev)
+    return _make_tensor(arr, False, dev)
 
 
 def ones(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
@@ -904,14 +1129,14 @@ def ones(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.ones(size, dtype=dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def ones_like(input: Tensor, dtype=None, device=None) -> Tensor:
-    dt = _resolve_dtype(dtype) or input._data.dtype
-    arr = np.ones_like(input._data, dtype=dt)
+    dt = _resolve_dtype(dtype) or input._ensure_cpu().dtype
+    arr = np.ones(input.shape, dtype=dt)
     dev = _resolve_device(device) if device else input._device
-    return Tensor._wrap(arr, False, None, dev)
+    return _make_tensor(arr, False, dev)
 
 
 def full(size, fill_value, dtype=None, device=None, requires_grad=False) -> Tensor:
@@ -921,7 +1146,7 @@ def full(size, fill_value, dtype=None, device=None, requires_grad=False) -> Tens
         size = (size,)
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.full(size, fill_value, dtype=dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def randn(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
@@ -929,7 +1154,7 @@ def randn(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.random.randn(*size).astype(dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def rand(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
@@ -937,7 +1162,7 @@ def rand(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.random.rand(*size).astype(dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def randint(low, high=None, size=None, dtype=None, device=None) -> Tensor:
@@ -952,20 +1177,20 @@ def randint(low, high=None, size=None, dtype=None, device=None) -> Tensor:
         size = (size,)
     dt = _resolve_dtype(dtype) or np.int64
     arr = np.random.randint(low, high, size=size).astype(dt)
-    return Tensor._wrap(arr, False, None, _resolve_device(device))
+    return _make_tensor(arr, False, _resolve_device(device))
 
 
 def arange(*args, dtype=None, device=None, requires_grad=False) -> Tensor:
     arr = np.arange(*args)
     if dtype is not None:
         arr = arr.astype(_resolve_dtype(dtype))
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def linspace(start, end, steps, dtype=None, device=None, requires_grad=False) -> Tensor:
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.linspace(start, end, steps, dtype=dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 def empty(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
@@ -973,7 +1198,7 @@ def empty(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
     arr = np.empty(size, dtype=dt)
-    return Tensor._wrap(arr, requires_grad, None, _resolve_device(device))
+    return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
 # ====================================================================
@@ -982,8 +1207,16 @@ def empty(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
     if _USE_CUDA and _is_cuda(a._device):
-        a_data = a._data
-        b_data = b._data
+        # GPU-resident fast path
+        if a._gpu is not None and b._gpu is not None:
+            a_ndim = len(a._gpu.shape)
+            b_ndim = len(b._gpu.shape)
+            if a_ndim == 2 and b_ndim == 2:
+                return Tensor._wrap_gpu(_cuops.dev_matmul(a._gpu, b._gpu), device=a._device)
+            elif a_ndim >= 3 or b_ndim >= 3:
+                return Tensor._wrap_gpu(_cuops.dev_batched_matmul(a._gpu, b._gpu), device=a._device)
+        a_data = a._ensure_cpu()
+        b_data = b._ensure_cpu()
         if a_data.ndim == 2 and b_data.ndim == 2:
             result_data = _cuops.cuda_matmul(a_data, b_data)
         elif a_data.ndim >= 3 or b_data.ndim >= 3:
@@ -991,6 +1224,8 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
         else:
             result_data = np.matmul(a_data, b_data)
     elif _USE_MPS:
+        a._ensure_cpu()
+        b._ensure_cpu()
         a_data = a._data
         b_data = b._data
         if a_data.ndim >= 2 and b_data.ndim >= 2 and a_data.dtype == np.float32:
@@ -1003,8 +1238,12 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
         else:
             result_data = np.matmul(a_data, b_data)
     elif _USE_CYTHON:
+        a._ensure_cpu()
+        b._ensure_cpu()
         result_data = _cops.matmul_forward(a._data, b._data)
     else:
+        a._ensure_cpu()
+        b._ensure_cpu()
         result_data = np.matmul(a._data, b._data)
     grad_fn = None
     rg = a._needs_grad(b)
@@ -1016,6 +1255,8 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
 
 
 def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    for t in tensors:
+        t._ensure_cpu()
     arrays = [t._data for t in tensors]
     result_data = np.concatenate(arrays, axis=dim)
     rg = any(t._requires_grad for t in tensors) and _ag.is_grad_enabled()
@@ -1031,6 +1272,8 @@ def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
 
 
 def stack(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    for t in tensors:
+        t._ensure_cpu()
     arrays = [t._data for t in tensors]
     result_data = np.stack(arrays, axis=dim)
     rg = any(t._requires_grad for t in tensors) and _ag.is_grad_enabled()
@@ -1049,14 +1292,17 @@ def outer(a: Tensor, b: Tensor) -> Tensor:
 
 def where(condition, x, y):
     if isinstance(condition, Tensor):
+        condition._ensure_cpu()
         condition_data = condition._data
     else:
         condition_data = np.asarray(condition)
     if isinstance(x, Tensor):
+        x._ensure_cpu()
         x_data = x._data
     else:
         x_data = x
     if isinstance(y, Tensor):
+        y._ensure_cpu()
         y_data = y._data
     else:
         y_data = y
@@ -1138,7 +1384,9 @@ def expm1(input: Tensor) -> Tensor:
 
 
 def softmax(input: Tensor, dim: int) -> Tensor:
-    x = input._data
+    if _USE_CUDA and _is_cuda(input._device) and input._gpu is not None:
+        return Tensor._wrap_gpu(_cuops.dev_softmax(input._gpu, dim), device=input._device)
+    x = input._ensure_cpu() if input._data is None else input._data
     if _USE_CUDA and _is_cuda(input._device):
         s = _cuops.cuda_softmax(x, dim)
     elif _USE_MPS and x.ndim == 2 and dim in (-1, x.ndim - 1) and x.dtype == np.float32:
@@ -1159,6 +1407,7 @@ def softmax(input: Tensor, dim: int) -> Tensor:
 
 
 def sort(input: Tensor, dim: int = -1, descending: bool = False):
+    input._ensure_cpu()
     if descending:
         sorted_arr = np.sort(input._data, axis=dim)[..., ::-1].copy()
         indices = np.argsort(input._data, axis=dim)[..., ::-1].copy()
@@ -1171,6 +1420,7 @@ def sort(input: Tensor, dim: int = -1, descending: bool = False):
 
 def multinomial(input: Tensor, num_samples: int,
                 replacement: bool = True) -> Tensor:
+    input._ensure_cpu()
     probs = input._data.astype(np.float64)
     if probs.ndim == 1:
         probs = probs / probs.sum()
@@ -1192,6 +1442,7 @@ def multinomial(input: Tensor, num_samples: int,
 
 
 def bernoulli(input: Tensor) -> Tensor:
+    input._ensure_cpu()
     arr = (np.random.rand(*input._data.shape) < input._data).astype(input._data.dtype)
     return Tensor._wrap(arr, False, None, input._device)
 

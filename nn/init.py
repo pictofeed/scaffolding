@@ -15,28 +15,38 @@ from .parameter import Parameter
 def normal_(tensor: Tensor | Parameter, mean: float = 0.0,
             std: float = 1.0) -> Tensor:
     """Fill tensor with values from N(mean, std^2) in-place."""
+    tensor._ensure_cpu()
     tensor._data[:] = np.random.normal(mean, std, tensor._data.shape).astype(tensor._data.dtype)
+    tensor._gpu = None
     return tensor
 
 
 def uniform_(tensor: Tensor | Parameter, a: float = 0.0,
              b: float = 1.0) -> Tensor:
+    tensor._ensure_cpu()
     tensor._data[:] = np.random.uniform(a, b, tensor._data.shape).astype(tensor._data.dtype)
+    tensor._gpu = None
     return tensor
 
 
 def zeros_(tensor: Tensor | Parameter) -> Tensor:
+    tensor._ensure_cpu()
     tensor._data.fill(0)
+    tensor._gpu = None
     return tensor
 
 
 def ones_(tensor: Tensor | Parameter) -> Tensor:
+    tensor._ensure_cpu()
     tensor._data.fill(1)
+    tensor._gpu = None
     return tensor
 
 
 def constant_(tensor: Tensor | Parameter, val: float) -> Tensor:
+    tensor._ensure_cpu()
     tensor._data.fill(val)
+    tensor._gpu = None
     return tensor
 
 
@@ -75,7 +85,7 @@ def kaiming_normal_(tensor: Tensor | Parameter, a: float = 0,
 
 
 def _calculate_fan_in_and_fan_out(tensor):
-    shape = tensor._data.shape
+    shape = tensor.shape
     if len(shape) < 2:
         raise ValueError("Fan in/out requires at least 2D tensor")
     fan_in = shape[1]

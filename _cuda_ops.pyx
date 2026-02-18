@@ -542,6 +542,515 @@ def gpu_to_numpy(CudaBuffer buf, tuple shape, dtype, stream=None):
 
 
 # ================================================================
+#  GpuTensor — GPU-RESIDENT TENSOR (CudaBuffer + shape + dtype)
+#
+#  Keeps data on device. Eliminates H2D/D2H per-op overhead.
+#  Upload once, run many ops, download once.
+# ================================================================
+
+class GpuTensor:
+    """GPU-resident tensor wrapping a CudaBuffer with shape/dtype metadata."""
+    __slots__ = ('buffer', 'shape', 'dtype', 'numel')
+
+    def __init__(self, CudaBuffer buffer, tuple shape, dtype):
+        self.buffer = buffer
+        self.shape = shape
+        self.dtype = dtype
+        cdef int64_t n = 1
+        for s in shape:
+            n *= s
+        self.numel = n
+
+
+def gputensor_from_numpy(np.ndarray arr not None):
+    """Upload NumPy array to GPU, return GpuTensor."""
+    cdef np.ndarray flat = np.ascontiguousarray(arr).ravel()
+    cdef size_t nbytes = flat.nbytes
+    cdef int device = 0
+    cudaGetDevice(&device)
+    cdef CudaBuffer buf = _make_buffer(nbytes, device)
+    _check_cuda(cudaMemcpy(buf.ptr, <void*>np.PyArray_DATA(flat),
+                           nbytes, cudaMemcpyHostToDevice))
+    return GpuTensor(buf, (<object>arr).shape, arr.dtype)
+
+
+def gputensor_to_numpy(gt):
+    """Download GpuTensor to NumPy array (sync)."""
+    cdef CudaBuffer buf = <CudaBuffer>(gt.buffer)
+    cdef np.ndarray result = np.empty(gt.shape, dtype=gt.dtype)
+    cdef size_t nbytes = result.nbytes
+    _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), buf.ptr,
+                           nbytes, cudaMemcpyDeviceToHost))
+    return result
+
+
+cdef CudaBuffer _gt_alloc(int64_t numel):
+    """Alloc an f32 device buffer for numel elements."""
+    cdef int device = 0
+    cudaGetDevice(&device)
+    return _make_buffer(numel * sizeof(float), device)
+
+
+cdef CudaBuffer _gt_alloc_bytes(size_t nbytes):
+    """Alloc a device buffer for given bytes."""
+    cdef int device = 0
+    cudaGetDevice(&device)
+    return _make_buffer(nbytes, device)
+
+
+# ────────────────────────────────────────────────────────────────
+#  DEVICE-RESIDENT OPS  (GpuTensor → GpuTensor, zero transfer)
+# ────────────────────────────────────────────────────────────────
+
+# --- Unary ops ---
+
+cdef _dev_unary(gt, int (*kernel)(const float*, float*, int64_t, cudaStream_t) noexcept nogil):
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef int ret
+    with nogil:
+        ret = kernel(<float*>src.ptr, <float*>dst.ptr, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype)
+
+def dev_exp(gt):
+    return _dev_unary(gt, cuda_exp_f32)
+
+def dev_log(gt):
+    return _dev_unary(gt, cuda_log_f32)
+
+def dev_sqrt(gt):
+    return _dev_unary(gt, cuda_sqrt_f32)
+
+def dev_rsqrt(gt):
+    return _dev_unary(gt, cuda_rsqrt_f32)
+
+def dev_sigmoid(gt):
+    return _dev_unary(gt, cuda_sigmoid_f32)
+
+def dev_tanh(gt):
+    return _dev_unary(gt, cuda_tanh_f32)
+
+def dev_sin(gt):
+    return _dev_unary(gt, cuda_sin_f32)
+
+def dev_cos(gt):
+    return _dev_unary(gt, cuda_cos_f32)
+
+def dev_neg(gt):
+    return _dev_unary(gt, cuda_neg_f32)
+
+def dev_abs(gt):
+    return _dev_unary(gt, cuda_abs_f32)
+
+def dev_relu(gt):
+    return _dev_unary(gt, cuda_relu_f32)
+
+def dev_silu(gt):
+    return _dev_unary(gt, cuda_silu_f32)
+
+def dev_gelu(gt):
+    return _dev_unary(gt, cuda_gelu_f32)
+
+
+# --- Binary ops ---
+
+cdef _dev_binary(gt_a, gt_b, int (*kernel)(const float*, const float*, float*, int64_t, cudaStream_t) noexcept nogil):
+    cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
+    cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
+    cdef int64_t n = gt_a.numel
+    cdef CudaBuffer c = _gt_alloc(n)
+    cdef int ret
+    with nogil:
+        ret = kernel(<float*>a.ptr, <float*>b.ptr, <float*>c.ptr, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(c, gt_a.shape, gt_a.dtype)
+
+def dev_add(gt_a, gt_b):
+    return _dev_binary(gt_a, gt_b, cuda_add_f32)
+
+def dev_sub(gt_a, gt_b):
+    return _dev_binary(gt_a, gt_b, cuda_sub_f32)
+
+def dev_mul(gt_a, gt_b):
+    return _dev_binary(gt_a, gt_b, cuda_mul_f32)
+
+def dev_div(gt_a, gt_b):
+    return _dev_binary(gt_a, gt_b, cuda_div_f32)
+
+
+# --- Scalar broadcast ops ---
+
+def dev_adds(gt, float scalar):
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef int ret
+    with nogil:
+        ret = cuda_adds_f32(<float*>src.ptr, scalar, <float*>dst.ptr, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype)
+
+def dev_muls(gt, float scalar):
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef int ret
+    with nogil:
+        ret = cuda_muls_f32(<float*>src.ptr, scalar, <float*>dst.ptr, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype)
+
+
+# --- Clamp ---
+
+def dev_clamp(gt, float lo, float hi):
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef int ret
+    with nogil:
+        ret = cuda_clamp_f32(<float*>src.ptr, <float*>dst.ptr, lo, hi, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype)
+
+
+# --- Softmax ---
+
+def dev_softmax(gt, int dim=-1):
+    """Softmax along last dim, device-resident."""
+    cdef tuple orig_shape = gt.shape
+    cdef int ndim = len(orig_shape)
+    cdef int rows, cols
+    if ndim >= 2 and (dim == -1 or dim == ndim - 1):
+        cols = orig_shape[ndim - 1]
+        rows = gt.numel // cols
+    else:
+        cols = orig_shape[ndim - 1]
+        rows = gt.numel // cols
+
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef CudaBuffer dst = _gt_alloc(gt.numel)
+    cdef int ret
+    with nogil:
+        ret = cuda_softmax_f32(<float*>src.ptr, <float*>dst.ptr, rows, cols, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, orig_shape, gt.dtype)
+
+
+def dev_log_softmax(gt, int dim=-1):
+    """Log-softmax along last dim, device-resident."""
+    cdef tuple orig_shape = gt.shape
+    cdef int ndim = len(orig_shape)
+    cdef int rows, cols
+    cols = orig_shape[ndim - 1]
+    rows = gt.numel // cols
+
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef CudaBuffer dst = _gt_alloc(gt.numel)
+    cdef int ret
+    with nogil:
+        ret = cuda_log_softmax_f32(<float*>src.ptr, <float*>dst.ptr, rows, cols, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, orig_shape, gt.dtype)
+
+
+# --- Cross-entropy ---
+
+def dev_cross_entropy(gt_logits, gt_targets):
+    """Fused cross-entropy on device. Returns (float_loss, GpuTensor_probs)."""
+    cdef CudaBuffer logits_buf = <CudaBuffer>(gt_logits.buffer)
+    cdef CudaBuffer targets_buf = <CudaBuffer>(gt_targets.buffer)
+    cdef int N = gt_logits.shape[0]
+    cdef int C = gt_logits.shape[1]
+    cdef size_t loss_bytes = N * sizeof(float)
+    cdef size_t logit_bytes = N * C * sizeof(float)
+
+    cdef CudaBuffer d_losses = _gt_alloc(N)
+    cdef CudaBuffer d_probs = _gt_alloc(N * C)
+
+    cdef int ret
+    with nogil:
+        ret = cuda_cross_entropy_fwd_f32(
+            <float*>logits_buf.ptr, <int64_t*>targets_buf.ptr,
+            <float*>d_losses.ptr, <float*>d_probs.ptr,
+            N, C, _default_stream)
+    _check_kernel(ret)
+
+    # Download losses to compute mean (small array)
+    cdef np.ndarray losses = np.empty(N, dtype=np.float32)
+    _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(losses), d_losses.ptr,
+                           loss_bytes, cudaMemcpyDeviceToHost))
+    cdef float mean_loss = float(np.mean(losses))
+    cdef GpuTensor probs_gt = GpuTensor(d_probs, (N, C), np.float32)
+    return mean_loss, probs_gt
+
+
+# --- GEMM (cuBLAS) ---
+
+def dev_matmul(gt_a, gt_b):
+    """C = A @ B via cuBLAS, device-resident. A (M,K), B (K,N)."""
+    cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
+    cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
+    cdef int M = gt_a.shape[0]
+    cdef int K = gt_a.shape[1]
+    cdef int N = gt_b.shape[1]
+    cdef CudaBuffer c = _gt_alloc(M * N)
+
+    cdef cublasHandle_t handle = _get_cublas()
+    cdef int ret = cuda_sgemm(handle, M, N, K,
+                              <float*>a.ptr, <float*>b.ptr, <float*>c.ptr,
+                              1.0, 0.0, False, False)
+    _check_kernel(ret)
+    return GpuTensor(c, (M, N), np.float32)
+
+
+def dev_matmul_nt(gt_a, gt_b):
+    """C = A @ B^T via cuBLAS, device-resident. A (M,K), B (N,K)."""
+    cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
+    cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
+    cdef int M = gt_a.shape[0]
+    cdef int K = gt_a.shape[1]
+    cdef int N = gt_b.shape[0]
+    cdef CudaBuffer c = _gt_alloc(M * N)
+
+    cdef cublasHandle_t handle = _get_cublas()
+    cdef int ret = cuda_sgemm(handle, M, N, K,
+                              <float*>a.ptr, <float*>b.ptr, <float*>c.ptr,
+                              1.0, 0.0, False, True)
+    _check_kernel(ret)
+    return GpuTensor(c, (M, N), np.float32)
+
+
+def dev_batched_matmul(gt_a, gt_b):
+    """Batched matmul on device. a: (..., M, K), b: (..., K, N)."""
+    cdef tuple a_shape = gt_a.shape
+    cdef tuple b_shape = gt_b.shape
+    cdef int ndim_a = len(a_shape)
+    cdef int ndim_b = len(b_shape)
+    cdef int M = a_shape[ndim_a - 2]
+    cdef int K = a_shape[ndim_a - 1]
+    cdef int N_ = b_shape[ndim_b - 1]
+    cdef int batch = 1
+    cdef int i
+    for i in range(ndim_a - 2):
+        batch *= a_shape[i]
+
+    cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
+    cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
+    cdef CudaBuffer c = _gt_alloc(batch * M * N_)
+
+    cdef cublasHandle_t handle = _get_cublas()
+    cdef int64_t strideA = M * K
+    cdef int64_t strideB = K * N_
+    cdef int64_t strideC = M * N_
+    cdef int ret = cuda_sgemm_batched(handle, M, N_, K,
+                                      <float*>a.ptr, <float*>b.ptr, <float*>c.ptr,
+                                      1.0, 0.0, batch, strideA, strideB, strideC)
+    _check_kernel(ret)
+    cdef tuple out_shape = a_shape[:ndim_a-2] + (M, N_)
+    return GpuTensor(c, out_shape, np.float32)
+
+
+# --- Layer norm ---
+
+def dev_layer_norm(gt_x, gt_gamma, gt_beta, float eps=1e-5):
+    """Layer norm on device. Input (N, D)."""
+    cdef CudaBuffer x_buf = <CudaBuffer>(gt_x.buffer)
+    cdef int N = gt_x.shape[0]
+    cdef int D = gt_x.shape[1]
+    cdef CudaBuffer y_buf = _gt_alloc(N * D)
+    cdef CudaBuffer mean_buf = _gt_alloc(N)
+    cdef CudaBuffer rstd_buf = _gt_alloc(N)
+    cdef float* gptr = NULL
+    cdef float* bptr = NULL
+    if gt_gamma is not None:
+        gptr = <float*>(<CudaBuffer>(gt_gamma.buffer)).ptr
+    if gt_beta is not None:
+        bptr = <float*>(<CudaBuffer>(gt_beta.buffer)).ptr
+
+    cdef int ret
+    with nogil:
+        ret = cuda_layer_norm_f32(<float*>x_buf.ptr, gptr, bptr,
+                                  <float*>y_buf.ptr, <float*>mean_buf.ptr, <float*>rstd_buf.ptr,
+                                  N, D, eps, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(y_buf, gt_x.shape, np.float32)
+
+
+# --- RMS norm ---
+
+def dev_rms_norm(gt_x, gt_gamma, float eps=1e-5):
+    """RMS norm on device. Input (N, D)."""
+    cdef CudaBuffer x_buf = <CudaBuffer>(gt_x.buffer)
+    cdef int N = gt_x.shape[0]
+    cdef int D = gt_x.shape[1]
+    cdef CudaBuffer y_buf = _gt_alloc(N * D)
+    cdef CudaBuffer rstd_buf = _gt_alloc(N)
+    cdef float* gptr = NULL
+    if gt_gamma is not None:
+        gptr = <float*>(<CudaBuffer>(gt_gamma.buffer)).ptr
+
+    cdef int ret
+    with nogil:
+        ret = cuda_rms_norm_f32(<float*>x_buf.ptr, gptr,
+                                <float*>y_buf.ptr, <float*>rstd_buf.ptr,
+                                N, D, eps, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(y_buf, gt_x.shape, np.float32)
+
+
+# --- Dropout ---
+
+def dev_dropout(gt, float p, unsigned long long seed=0):
+    """Dropout on device. Returns (output_GpuTensor, mask_GpuTensor)."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef CudaBuffer mask_buf = _gt_alloc(n)
+
+    cdef int ret
+    with nogil:
+        ret = cuda_dropout_f32(<float*>src.ptr, <float*>dst.ptr, <float*>mask_buf.ptr,
+                               p, n, seed, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype), GpuTensor(mask_buf, gt.shape, gt.dtype)
+
+
+# --- Embedding ---
+
+def dev_embedding(gt_weight, gt_indices, int embed_dim):
+    """Embedding lookup on device."""
+    cdef CudaBuffer w_buf = <CudaBuffer>(gt_weight.buffer)
+    cdef CudaBuffer idx_buf = <CudaBuffer>(gt_indices.buffer)
+    cdef int num_idx = gt_indices.numel
+    cdef CudaBuffer out_buf = _gt_alloc(num_idx * embed_dim)
+
+    cdef int ret
+    with nogil:
+        ret = cuda_embedding_f32(<float*>w_buf.ptr, <int64_t*>idx_buf.ptr,
+                                 <float*>out_buf.ptr, num_idx, embed_dim, _default_stream)
+    _check_kernel(ret)
+    cdef tuple out_shape = gt_indices.shape + (embed_dim,)
+    return GpuTensor(out_buf, out_shape, np.float32)
+
+
+# --- Linear forward ---
+
+def dev_linear_forward(gt_x, gt_weight, gt_bias=None):
+    """y = x @ W^T + bias on device."""
+    cdef int M = gt_x.numel // gt_x.shape[len(gt_x.shape) - 1]
+    cdef int K = gt_x.shape[len(gt_x.shape) - 1]
+    cdef int N = gt_weight.shape[0]
+
+    # Reshape x to 2D for matmul
+    cdef CudaBuffer x_buf = <CudaBuffer>(gt_x.buffer)
+    cdef CudaBuffer w_buf = <CudaBuffer>(gt_weight.buffer)
+    cdef CudaBuffer c_buf = _gt_alloc(M * N)
+
+    cdef cublasHandle_t handle = _get_cublas()
+    cdef int ret = cuda_sgemm(handle, M, N, K,
+                              <float*>x_buf.ptr, <float*>w_buf.ptr, <float*>c_buf.ptr,
+                              1.0, 0.0, False, True)
+    _check_kernel(ret)
+
+    # Add bias if present
+    if gt_bias is not None:
+        # Broadcast add: result[i] += bias for each row
+        # We need to download, add, upload — but bias is small
+        # Better: use a kernel. For now use adds row-by-row via a simple loop kernel
+        # Actually, just do it via the add kernel with broadcasting
+        cdef CudaBuffer b_buf = <CudaBuffer>(gt_bias.buffer)
+        # We need a proper broadcast add kernel, fall back to download/upload for bias
+        cdef np.ndarray c_np = np.empty((M, N), dtype=np.float32)
+        _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(c_np), c_buf.ptr,
+                               M * N * sizeof(float), cudaMemcpyDeviceToHost))
+        cdef np.ndarray b_np = np.empty(N, dtype=np.float32)
+        _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(b_np), b_buf.ptr,
+                               N * sizeof(float), cudaMemcpyDeviceToHost))
+        c_np += b_np
+        _check_cuda(cudaMemcpy(c_buf.ptr, <void*>np.PyArray_DATA(c_np),
+                               M * N * sizeof(float), cudaMemcpyHostToDevice))
+
+    cdef tuple out_shape = gt_x.shape[:-1] + (N,)
+    return GpuTensor(c_buf, out_shape, np.float32)
+
+
+# --- AdamW fused step ---
+
+def dev_adamw_step(gt_param, gt_grad, gt_m, gt_v,
+                   float lr, float beta1, float beta2,
+                   float eps, float wd, float bc1, float bc2):
+    """Fused AdamW step on device. Modifies param/m/v in-place (their buffers)."""
+    cdef CudaBuffer p = <CudaBuffer>(gt_param.buffer)
+    cdef CudaBuffer g = <CudaBuffer>(gt_grad.buffer)
+    cdef CudaBuffer m = <CudaBuffer>(gt_m.buffer)
+    cdef CudaBuffer v = <CudaBuffer>(gt_v.buffer)
+    cdef int64_t n = gt_param.numel
+
+    cdef int ret
+    with nogil:
+        ret = cuda_adamw_step_f32(<float*>p.ptr, <float*>g.ptr,
+                                  <float*>m.ptr, <float*>v.ptr,
+                                  lr, beta1, beta2, eps, wd, bc1, bc2,
+                                  n, _default_stream)
+    _check_kernel(ret)
+    # In-place: buffers modified. Caller keeps same GpuTensors.
+
+
+# --- Sum reduction ---
+
+def dev_sum(gt):
+    """Global sum on device, returns Python float."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef CudaBuffer dst = _gt_alloc(1)
+    cdef int ret
+    with nogil:
+        ret = cuda_sum_f32(<float*>src.ptr, <float*>dst.ptr, n, _default_stream)
+    _check_kernel(ret)
+    cdef float result = 0.0
+    _check_cuda(cudaMemcpy(&result, dst.ptr, sizeof(float), cudaMemcpyDeviceToHost))
+    return float(result)
+
+
+# --- Fill / Copy utilities ---
+
+def dev_fill(gt, float value):
+    """Fill GpuTensor with scalar value (in-place)."""
+    cdef CudaBuffer buf = <CudaBuffer>(gt.buffer)
+    cdef int ret
+    with nogil:
+        ret = cuda_fill_f32(<float*>buf.ptr, value, gt.numel, _default_stream)
+    _check_kernel(ret)
+
+def dev_copy(gt_src, gt_dst):
+    """Copy device → device."""
+    cdef CudaBuffer src = <CudaBuffer>(gt_src.buffer)
+    cdef CudaBuffer dst = <CudaBuffer>(gt_dst.buffer)
+    cdef int ret
+    with nogil:
+        ret = cuda_copy_f32(<float*>src.ptr, <float*>dst.ptr, gt_src.numel, _default_stream)
+    _check_kernel(ret)
+
+
+# --- Transpose ---
+
+def dev_transpose_2d(gt):
+    """2D transpose on device."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int rows = gt.shape[0]
+    cdef int cols = gt.shape[1]
+    cdef CudaBuffer dst = _gt_alloc(rows * cols)
+    cdef int ret
+    with nogil:
+        ret = cuda_transpose_2d_f32(<float*>src.ptr, <float*>dst.ptr, rows, cols, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, (cols, rows), gt.dtype)
+
+
+# ================================================================
 #  HIGH-LEVEL KERNEL WRAPPERS — accept/return NumPy arrays
 #
 #  Each wrapper:
@@ -551,8 +1060,8 @@ def gpu_to_numpy(CudaBuffer buf, tuple shape, dtype, stream=None):
 #    4. Downloads result to NumPy
 #    5. Frees GPU buffers (via CudaBuffer ref-counting)
 #
-#  For on-device tensor workflows, callers can use the _dev variants
-#  which accept/return CudaBuffer directly.
+#  For on-device tensor workflows, callers can use the dev_* variants
+#  which accept/return GpuTensor directly.
 # ================================================================
 
 # ----------------------------------------------------------------

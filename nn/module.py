@@ -142,9 +142,11 @@ class Module:
             if key in own_sd:
                 target = own_sd[key]
                 if isinstance(val, Tensor):
-                    target._data = val._data.copy()
+                    target._data = val._ensure_cpu().copy()
+                    target._gpu = None
                 elif isinstance(val, np.ndarray):
                     target._data = val.copy()
+                    target._gpu = None
 
     # ---- Training mode ----
 
@@ -215,10 +217,14 @@ class Module:
 
     def _apply(self, fn):
         for p in self._parameters.values():
+            p._ensure_cpu()
             p._data = fn(p._data)
+            p._gpu = None
         for name, buf in self._buffers.items():
             if buf is not None:
+                buf._ensure_cpu()
                 self._buffers[name]._data = fn(buf._data)
+                self._buffers[name]._gpu = None
         for m in self._modules.values():
             if isinstance(m, Module):
                 m._apply(fn)
