@@ -26,6 +26,13 @@ try:
 except ImportError:
     _USE_CYTHON_ADAM = False
 
+# Try CUDA-accelerated AdamW (fused GPU kernel)
+try:
+    from .._cuda_ops import cuda_adamw_step as _cuda_adamw
+    _USE_CUDA_ADAM = True
+except ImportError:
+    _USE_CUDA_ADAM = False
+
 
 class Optimizer:
     """Base class for all optimizers."""
@@ -113,7 +120,12 @@ class AdamW(Optimizer):
                 bc1 = 1.0 - beta1 ** t
                 bc2 = 1.0 - beta2 ** t
 
-                if _USE_MPS_ADAM and p._data.dtype == np.float32:
+                if (_USE_CUDA_ADAM and p._data.dtype == np.float32
+                        and hasattr(p, '_device') and p._device._type == 'cuda'):
+                    # Fused CUDA AdamW kernel — single pass over all params
+                    _cuda_adamw(p._data, grad, m, v,
+                                lr, beta1, beta2, eps, wd, t)
+                elif _USE_MPS_ADAM and p._data.dtype == np.float32:
                     # Use Accelerate vDSP vectorized AdamW (fastest)
                     _accel_adamw(p._data, grad, m, v,
                                 lr, beta1, beta2, eps, wd, bc1, bc2)

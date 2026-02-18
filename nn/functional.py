@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 """nn.functional — stateless neural network operations (F.*)."""
 from __future__ import annotations
@@ -8,14 +8,16 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _mops, _cops
+from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _USE_CUDA, _mops, _cops, _cuops, _is_cuda
 from .. import autograd as _ag
 
 
 # ──────────────────────── Activations ─────────────────────────────────
 
 def relu(input: Tensor, inplace: bool = False) -> Tensor:
-    if _USE_MPS and input._data.dtype == np.float32:
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data = _cuops.cuda_relu(input._data)
+    elif _USE_MPS and input._data.dtype == np.float32:
         result_data = _mops.accelerate_relu(input._data)
     else:
         result_data = np.maximum(input._data, 0)
@@ -29,7 +31,10 @@ def relu(input: Tensor, inplace: bool = False) -> Tensor:
 
 
 def silu(input: Tensor) -> Tensor:
-    if _USE_MPS:
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data = _cuops.cuda_silu(input._data)
+        sig_data = None
+    elif _USE_MPS:
         result_data, sig_data = _mops.accelerate_silu_fwd(input._data)
     elif _USE_CYTHON:
         flat = np.ascontiguousarray(input._data).ravel()
@@ -52,7 +57,9 @@ def silu(input: Tensor) -> Tensor:
 
 
 def gelu(input: Tensor) -> Tensor:
-    if _USE_MPS:
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data = _cuops.cuda_gelu(input._data)
+    elif _USE_MPS:
         result_data = _mops.accelerate_gelu(input._data)
     else:
         x = input._data
@@ -89,7 +96,9 @@ def softplus(input: Tensor, beta: float = 1.0,
 
 def softmax(input: Tensor, dim: int = -1, dtype=None) -> Tensor:
     x = input._data
-    if _USE_MPS and x.dtype == np.float32:
+    if _USE_CUDA and _is_cuda(input._device):
+        s = _cuops.cuda_softmax(x, dim)
+    elif _USE_MPS and x.dtype == np.float32:
         # Reshape to 2D for Accelerate path
         if x.ndim == 2 and dim in (-1, x.ndim - 1):
             s = _mops.accelerate_softmax(np.ascontiguousarray(x), -1)
@@ -120,9 +129,12 @@ def softmax(input: Tensor, dim: int = -1, dtype=None) -> Tensor:
 
 def log_softmax(input: Tensor, dim: int = -1) -> Tensor:
     x = input._data
-    x_max = np.max(x, axis=dim, keepdims=True)
-    logsumexp = np.log(np.sum(np.exp(x - x_max), axis=dim, keepdims=True)) + x_max
-    result_data = x - logsumexp
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data = _cuops.cuda_log_softmax(x, dim)
+    else:
+        x_max = np.max(x, axis=dim, keepdims=True)
+        logsumexp = np.log(np.sum(np.exp(x - x_max), axis=dim, keepdims=True)) + x_max
+        result_data = x - logsumexp
     return Tensor._wrap(result_data, input._requires_grad, None, input._device)
 
 
@@ -141,6 +153,17 @@ def cross_entropy(input: Tensor, target: Tensor,
 
     N = x.shape[0]
     rg = input._requires_grad and _ag.is_grad_enabled()
+
+    # Fast path: fully fused CUDA cross-entropy kernel
+    if _USE_CUDA and _is_cuda(input._device) and x.dtype == np.float32 and reduction == 'mean':
+        loss_val, probs = _cuops.cuda_cross_entropy(x, t.astype(np.int64))
+        result_data = np.float32(loss_val)
+        grad_fn = None
+        if rg:
+            grad_fn = _ag.CrossEntropyBackward()
+            grad_fn.inputs = [input, None]
+            grad_fn.saved = {'probs': probs, 'target': t}
+        return Tensor._wrap(result_data, rg, grad_fn, input._device)
 
     # Fast path: fully fused Accelerate kernel (no grad needed)
     if _USE_MPS and x.dtype == np.float32 and reduction == 'mean' and not rg:
@@ -184,15 +207,20 @@ def dropout(input: Tensor, p: float = 0.5,
             training: bool = True) -> Tensor:
     if not training or p == 0.0:
         return input
-    mask = (np.random.rand(*input._data.shape) > p).astype(input._data.dtype)
-    scale = 1.0 / (1.0 - p)
-    result_data = input._data * mask * scale
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data, mask = _cuops.cuda_dropout(input._data, p)
+        mask = mask.astype(input._data.dtype) / (1.0 - p)
+    else:
+        mask = (np.random.rand(*input._data.shape) > p).astype(input._data.dtype)
+        scale = 1.0 / (1.0 - p)
+        result_data = input._data * mask * scale
+        mask = mask * scale
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
         grad_fn = _ag.DropoutBackward()
         grad_fn.inputs = [input]
-        grad_fn.saved = {'mask': mask * scale}
+        grad_fn.saved = {'mask': mask}
     return Tensor._wrap(result_data, rg, grad_fn, input._device)
 
 
@@ -288,8 +316,14 @@ def scaled_dot_product_attention(
 
 def linear(input: Tensor, weight: Tensor,
            bias: Tensor | None = None) -> Tensor:
-    result_data = np.matmul(input._data, weight._data.T)
-    if bias is not None:
-        result_data = result_data + bias._data
+    if _USE_CUDA and _is_cuda(input._device):
+        result_data = _cuops.cuda_linear_forward(
+            input._data, weight._data,
+            bias._data if bias is not None else None
+        )
+    else:
+        result_data = np.matmul(input._data, weight._data.T)
+        if bias is not None:
+            result_data = result_data + bias._data
     rg = (input._requires_grad or weight._requires_grad) and _ag.is_grad_enabled()
     return Tensor._wrap(result_data, rg, None, input._device)

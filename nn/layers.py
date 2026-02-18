@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _mops, _cops
+from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _USE_CUDA, _mops, _cops, _cuops, _is_cuda
 from .. import autograd as _ag
 from .module import Module
 from .parameter import Parameter
@@ -36,13 +36,22 @@ class Linear(Module):
     def forward(self, x: Tensor) -> Tensor:
         # Use BLAS sgemm_nt to avoid transposing weight
         w_data = self.weight._data
-        if _USE_MPS and x._data.dtype == np.float32 and w_data.dtype == np.float32:
+        if _USE_CUDA and _is_cuda(x._device):
+            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+            result_data = _cuops.cuda_linear_forward(
+                x._data, w_data,
+                self.bias._data if has_bias else None
+            )
+        elif _USE_MPS and x._data.dtype == np.float32 and w_data.dtype == np.float32:
             result_data = _mops.accelerate_linear_forward(x._data, w_data)
+            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+            if has_bias:
+                result_data = result_data + self.bias._data
         else:
             result_data = x._data @ w_data.T
-        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
-        if has_bias:
-            result_data = result_data + self.bias._data
+            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+            if has_bias:
+                result_data = result_data + self.bias._data
 
         rg = (x._requires_grad or self.weight._requires_grad) and _ag.is_grad_enabled()
         grad_fn = None
@@ -81,7 +90,10 @@ class Embedding(Module):
         idx = indices._data
         if idx.dtype != np.intp:
             idx = idx.astype(np.intp)
-        result_data = self.weight._data[idx]
+        if _USE_CUDA and _is_cuda(indices._device):
+            result_data = _cuops.cuda_embedding(self.weight._data, idx.astype(np.int64))
+        else:
+            result_data = self.weight._data[idx]
 
         rg = self.weight._requires_grad and _ag.is_grad_enabled()
         grad_fn = None
@@ -249,7 +261,9 @@ class SiLU(Module):
     """SiLU (Swish) activation: x * sigmoid(x)."""
 
     def forward(self, x: Tensor) -> Tensor:
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(x._device):
+            result_data = _cuops.cuda_silu(x._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_silu(x._data)
         elif _USE_CYTHON:
             flat = np.ascontiguousarray(x._data).ravel()
@@ -277,7 +291,10 @@ class ReLU(Module):
     """ReLU activation."""
 
     def forward(self, x: Tensor) -> Tensor:
-        result_data = np.maximum(x._data, 0)
+        if _USE_CUDA and _is_cuda(x._device):
+            result_data = _cuops.cuda_relu(x._data)
+        else:
+            result_data = np.maximum(x._data, 0)
         rg = x._requires_grad and _ag.is_grad_enabled()
         grad_fn = None
         if rg:
@@ -291,7 +308,9 @@ class GELU(Module):
     """Gaussian Error Linear Unit."""
 
     def forward(self, x: Tensor) -> Tensor:
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(x._device):
+            result_data = _cuops.cuda_gelu(x._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_gelu(x._data)
         else:
             result_data = 0.5 * x._data * (1 + np.tanh(

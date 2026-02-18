@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Helix Technologies, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 #
 # Convenience Makefile — wraps both setuptools and CMake builds.

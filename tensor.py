@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 """Core Tensor class backed by NumPy with autograd support."""
 from __future__ import annotations
@@ -29,10 +29,23 @@ except ImportError:
     _mops = None  # type: ignore[assignment]
     _USE_MPS = False
 
+# Try to import CUDA ops (NVIDIA GPU)
+try:
+    from . import _cuda_ops as _cuops
+    _USE_CUDA = True
+except ImportError:
+    _cuops = None  # type: ignore[assignment]
+    _USE_CUDA = False
+
 
 def _is_mps(device) -> bool:
     """Check if device is MPS (Metal Performance Shaders)."""
     return device is not None and device._type == 'mps'
+
+
+def _is_cuda(device) -> bool:
+    """Check if device is CUDA."""
+    return device is not None and device._type == 'cuda'
 
 
 # Singleton CPU device to avoid repeated Device('cpu') allocation
@@ -426,7 +439,9 @@ class Tensor:
         return self.__pow__(exp)
 
     def exp(self) -> 'Tensor':
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_exp(self._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_exp(self._data)
         elif _USE_CYTHON:
             result_data = _cops.exp_forward(self._data)
@@ -441,7 +456,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def log(self) -> 'Tensor':
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_log(self._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_log(self._data)
         else:
             result_data = np.log(self._data)
@@ -454,7 +471,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def sqrt(self) -> 'Tensor':
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_sqrt(self._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_sqrt(self._data)
         else:
             result_data = np.sqrt(self._data)
@@ -467,7 +486,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def rsqrt(self) -> 'Tensor':
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_rsqrt(self._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_rsqrt(self._data)
         else:
             result_data = 1.0 / np.sqrt(self._data)
@@ -480,7 +501,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def sigmoid(self) -> 'Tensor':
-        if _USE_MPS:
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_sigmoid(self._data)
+        elif _USE_MPS:
             result_data = _mops.accelerate_sigmoid(self._data)
         elif _USE_CYTHON:
             result_data = _cops.sigmoid_forward(self._data)
@@ -497,7 +520,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def sin(self) -> 'Tensor':
-        result_data = np.sin(self._data)
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_sin(self._data)
+        else:
+            result_data = np.sin(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -507,7 +533,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def cos(self) -> 'Tensor':
-        result_data = np.cos(self._data)
+        if _USE_CUDA and _is_cuda(self._device):
+            result_data = _cuops.cuda_cos(self._data)
+        else:
+            result_data = np.cos(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -517,7 +546,12 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def clamp(self, min=None, max=None) -> 'Tensor':
-        result_data = np.clip(self._data, min, max)
+        if _USE_CUDA and _is_cuda(self._device):
+            lo = min if min is not None else -3.4e38
+            hi = max if max is not None else 3.4e38
+            result_data = _cuops.cuda_clamp(self._data, lo, hi)
+        else:
+            result_data = np.clip(self._data, min, max)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -947,7 +981,16 @@ def empty(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
 # ====================================================================
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
-    if _USE_MPS:
+    if _USE_CUDA and _is_cuda(a._device):
+        a_data = a._data
+        b_data = b._data
+        if a_data.ndim == 2 and b_data.ndim == 2:
+            result_data = _cuops.cuda_matmul(a_data, b_data)
+        elif a_data.ndim >= 3 or b_data.ndim >= 3:
+            result_data = _cuops.cuda_batched_matmul(a_data, b_data)
+        else:
+            result_data = np.matmul(a_data, b_data)
+    elif _USE_MPS:
         a_data = a._data
         b_data = b._data
         if a_data.ndim >= 2 and b_data.ndim >= 2 and a_data.dtype == np.float32:
@@ -1096,7 +1139,9 @@ def expm1(input: Tensor) -> Tensor:
 
 def softmax(input: Tensor, dim: int) -> Tensor:
     x = input._data
-    if _USE_MPS and x.ndim == 2 and dim in (-1, x.ndim - 1) and x.dtype == np.float32:
+    if _USE_CUDA and _is_cuda(input._device):
+        s = _cuops.cuda_softmax(x, dim)
+    elif _USE_MPS and x.ndim == 2 and dim in (-1, x.ndim - 1) and x.dtype == np.float32:
         s = _mops.accelerate_softmax(x, dim)
     else:
         x_max = x.max(axis=dim, keepdims=True)
