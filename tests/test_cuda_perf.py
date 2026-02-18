@@ -584,7 +584,7 @@ def print_gpu_info():
         print(f'  PyTorch device:   {torch.cuda.get_device_name(dev)}')
         cap = torch.cuda.get_device_capability(dev)
         print(f'  Compute cap:      {cap[0]}.{cap[1]}')
-        mem = torch.cuda.get_device_properties(dev).total_mem / (1024**3)
+        mem = torch.cuda.get_device_properties(dev).total_memory / (1024**3)
         print(f'  Total memory:     {mem:.1f} GB')
     else:
         print('  PyTorch CUDA:     NOT AVAILABLE')
