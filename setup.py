@@ -57,32 +57,97 @@ IS_WINDOWS = platform.system() == 'Windows'
 #  CUDA detection helpers
 # ══════════════════════════════════════════════════════════════════════
 
+def _has_cuda_files(path: str) -> bool:
+    """Return True if *path* looks like a CUDA toolkit root.
+
+    We check for the presence of an ``include/cuda.h`` header **or**
+    an ``nvcc`` binary inside ``bin/``.  This avoids false-positives
+    when the derived path is just ``/usr``.
+    """
+    if not os.path.isdir(path):
+        return False
+    if os.path.isfile(os.path.join(path, 'include', 'cuda.h')):
+        return True
+    if os.path.isfile(os.path.join(path, 'bin', 'nvcc')):
+        return True
+    return False
+
+
 def _find_cuda_home() -> str | None:
-    """Locate the CUDA toolkit root directory."""
+    """Locate the CUDA toolkit root directory.
+
+    Detection strategy (first match wins):
+      1. ``CUDA_HOME`` or ``CUDA_PATH`` environment variable.
+      2. ``nvcc`` on ``$PATH`` → derive toolkit root.  A special
+         case handles the Ubuntu apt layout where ``nvcc`` lives in
+         ``/usr/bin`` but CUDA headers/libs are elsewhere.
+      3. ``/etc/alternatives/cuda`` symlink (Debian/Ubuntu).
+      4. ``/usr/local/cuda`` symlink (NVIDIA .run / .deb installer).
+      5. Versioned directories ``/usr/local/cuda-XX.Y`` (highest
+         version wins).
+      6. ``/opt/cuda``.
+      7. The ``/usr`` prefix itself (Ubuntu ``nvidia-cuda-toolkit``
+         package places headers in ``/usr/include`` and libs in
+         ``/usr/lib``).
+      8. Windows default paths.
+    """
+    import glob as _glob
+
     # 1. Explicit env var
     for var in ('CUDA_HOME', 'CUDA_PATH'):
         p = os.environ.get(var)
         if p and os.path.isdir(p):
             return p
+
     # 2. nvcc on PATH → derive CUDA_HOME
     nvcc = shutil.which('nvcc')
     if nvcc:
-        # /usr/local/cuda/bin/nvcc → /usr/local/cuda
-        return os.path.dirname(os.path.dirname(os.path.realpath(nvcc)))
-    # 3. Common default paths
-    for candidate in (
-        '/usr/local/cuda',
-        '/opt/cuda',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.4',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.3',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.2',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.1',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v12.0',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.8',
-        'C:\\Program Files\\NVIDIA GPU Computing Toolkit\\CUDA\\v11.7',
-    ):
-        if os.path.isdir(candidate):
+        real_nvcc = os.path.realpath(nvcc)
+        derived = os.path.dirname(os.path.dirname(real_nvcc))
+        # If derived is something like /usr/local/cuda — great.
+        # If derived is /usr (apt install), check first before accepting;
+        # prefer more specific paths found below.
+        if derived != '/usr' and _has_cuda_files(derived):
+            return derived
+
+    # 3. /etc/alternatives/cuda (Debian / Ubuntu)
+    alt = '/etc/alternatives/cuda'
+    if os.path.isdir(alt):
+        real = os.path.realpath(alt)
+        if _has_cuda_files(real):
+            return real
+
+    # 4. /usr/local/cuda symlink
+    if _has_cuda_files('/usr/local/cuda'):
+        return '/usr/local/cuda'
+
+    # 5. Versioned dirs /usr/local/cuda-XX.Y — pick the newest
+    versioned = sorted(
+        _glob.glob('/usr/local/cuda-*'),
+        key=lambda p: list(map(int, re.findall(r'\d+', os.path.basename(p)))),
+        reverse=True,
+    )
+    for candidate in versioned:
+        if _has_cuda_files(candidate):
             return candidate
+
+    # 6. /opt/cuda
+    if _has_cuda_files('/opt/cuda'):
+        return '/opt/cuda'
+
+    # 7. /usr prefix (Ubuntu nvidia-cuda-toolkit apt package)
+    if _has_cuda_files('/usr'):
+        return '/usr'
+
+    # 8. Windows default paths
+    if IS_WINDOWS:
+        for wver in ('12.8', '12.6', '12.4', '12.3', '12.2', '12.1',
+                      '12.0', '11.8', '11.7'):
+            wpath = (f'C:\\Program Files\\NVIDIA GPU Computing '
+                     f'Toolkit\\CUDA\\v{wver}')
+            if os.path.isdir(wpath):
+                return wpath
+
     return None
 
 
@@ -297,11 +362,31 @@ def _build_cuda_extension():
           f'at {CUDA_HOME}')
 
     cuda_include = os.path.join(CUDA_HOME, 'include')
-    cuda_lib = os.path.join(CUDA_HOME, 'lib64')
-    if not os.path.isdir(cuda_lib):
-        cuda_lib = os.path.join(CUDA_HOME, 'lib', 'x64')  # Windows
-    if not os.path.isdir(cuda_lib):
-        cuda_lib = os.path.join(CUDA_HOME, 'lib')  # fallback
+    # Determine CUDA library directory — differs across distros:
+    #   /usr/local/cuda/lib64          (NVIDIA .run installer)
+    #   /usr/lib/x86_64-linux-gnu      (Ubuntu apt, x86-64)
+    #   /usr/lib/aarch64-linux-gnu     (Ubuntu apt, ARM64)
+    #   CUDA_HOME/lib/x64              (Windows)
+    #   CUDA_HOME/lib                  (generic fallback)
+    cuda_lib_candidates = [
+        os.path.join(CUDA_HOME, 'lib64'),
+    ]
+    # Ubuntu multiarch: /usr/lib/<triplet>
+    machine = platform.machine()
+    if machine in ('x86_64', 'AMD64'):
+        cuda_lib_candidates.append(
+            os.path.join(CUDA_HOME, 'lib', 'x86_64-linux-gnu'))
+    elif machine == 'aarch64':
+        cuda_lib_candidates.append(
+            os.path.join(CUDA_HOME, 'lib', 'aarch64-linux-gnu'))
+    cuda_lib_candidates += [
+        os.path.join(CUDA_HOME, 'lib', 'x64'),   # Windows
+        os.path.join(CUDA_HOME, 'lib'),           # fallback
+    ]
+    cuda_lib = next(
+        (p for p in cuda_lib_candidates if os.path.isdir(p)),
+        os.path.join(CUDA_HOME, 'lib64'),  # default even if missing
+    )
 
     cuda_ops_src = '_cuda_ops.pyx' if USE_CYTHON else '_cuda_ops.c'
 
