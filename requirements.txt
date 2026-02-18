@@ -1,0 +1,5 @@
+# Scaffolding — Runtime dependencies
+numpy>=1.24
+
+# Build dependencies (install these to compile Cython extensions)
+# cython>=3.0
