@@ -783,7 +783,7 @@ def dev_cross_entropy(gt_logits, gt_targets):
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(losses), d_losses.ptr,
                            loss_bytes, cudaMemcpyDeviceToHost))
     cdef float mean_loss = float(np.mean(losses))
-    cdef GpuTensor probs_gt = GpuTensor(d_probs, (N, C), np.float32)
+    probs_gt = GpuTensor(d_probs, (N, C), np.float32)
     return mean_loss, probs_gt
 
 
