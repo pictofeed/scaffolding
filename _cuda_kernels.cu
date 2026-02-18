@@ -1465,16 +1465,15 @@ extern "C" int cuda_dropout_f32(const float* x, float* y, float* mask,
     /* Each thread handles 4 elements, so divide grid by 4 */
     int64_t n_threads = (n + 3) / 4;
 
-    /* cuRAND Philox state is very register-heavy (~50+ regs/thread).
-     * Use occupancy API to find the largest valid block size for this
-     * kernel's actual register usage, instead of a fixed BLOCK_1D
-     * which may exceed register budget on Kepler/K80. */
-    int block, min_grid;
-    cudaOccupancyMaxPotentialBlockSize(&min_grid, &block,
-                                       dropout_f32_kernel, 0, 0);
-    if (block <= 0) block = 64;  /* fallback */
+    /* cuRAND Philox state is very register-heavy (~50+ regs per thread).
+     * On K80 with maxrregcount or limited registers, large block sizes
+     * cause "invalid argument" launch failures.  Use 64 threads/block
+     * which guarantees launch: 64 * 64 regs = 4096 < 65536 regs/SM. */
+    int block = 64;
+    int g = grid_size(n_threads, block);
+    if (g <= 0) g = 1;
 
-    dropout_f32_kernel<<<grid_size(n_threads, block), block, 0, stream>>>(
+    dropout_f32_kernel<<<g, block, 0, stream>>>(
         x, y, mask, p, scale, n, seed);
     CUDA_CHECK(cudaGetLastError());
     return 0;
