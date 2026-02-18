@@ -233,20 +233,34 @@ class DataParallel(Module):
         if len(outputs) == 1:
             return outputs[0]
 
-        # Download all to CPU, concatenate, re-upload to output device
+        # Check if outputs are tuples (e.g., cross-entropy returns (loss, probs))
+        if isinstance(outputs[0], (tuple, list)):
+            gathered_parts = []
+            for i in range(len(outputs[0])):
+                elements = [o[i] for o in outputs]
+                gathered_parts.append(
+                    self._gather(elements, output_device, dim))
+            return type(outputs[0])(gathered_parts)
+
+        # Download all to CPU
         cpu_arrays = []
         for out in outputs:
             if isinstance(out, Tensor):
-                cpu_arrays.append(out._ensure_cpu())
-            elif isinstance(out, (tuple, list)):
-                # Handle tuple outputs (e.g., cross-entropy returns (loss, probs))
-                # Gather each element
-                pass
-            else:
+                arr = out._ensure_cpu()
+                if arr is None:
+                    arr = out._data
+                cpu_arrays.append(arr)
+            elif isinstance(out, np.ndarray):
                 cpu_arrays.append(out)
+            else:
+                cpu_arrays.append(np.asarray(out))
 
         if cpu_arrays:
-            gathered = np.concatenate(cpu_arrays, axis=dim)
+            # Scalar (0-d) outputs: average them (e.g., loss values)
+            if cpu_arrays[0].ndim == 0:
+                gathered = np.mean(cpu_arrays).astype(cpu_arrays[0].dtype)
+            else:
+                gathered = np.concatenate(cpu_arrays, axis=dim)
             result = Tensor(gathered, device=Device(f'cuda:{output_device}'))
             return result
 
