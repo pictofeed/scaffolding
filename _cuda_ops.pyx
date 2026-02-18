@@ -527,7 +527,7 @@ def numpy_to_gpu(np.ndarray arr not None, stream=None):
     cdef cudaStream_t s = _get_stream(stream)
     _check_cuda(cudaMemcpyAsync(buf.ptr, <void*>np.PyArray_DATA(flat),
                                 nbytes, cudaMemcpyHostToDevice, s))
-    return buf, arr.shape, arr.dtype
+    return buf, (<object>arr).shape, arr.dtype
 
 def gpu_to_numpy(CudaBuffer buf, tuple shape, dtype, stream=None):
     """Download GPU buffer to a NumPy array."""
@@ -582,7 +582,7 @@ cdef np.ndarray _unary_op_host(np.ndarray x, int (*kernel)(const float*, float*,
     _check_kernel(ret)
 
     # D2H
-    cdef np.ndarray result = np.empty(x.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>x).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_y.ptr,
                            nbytes, cudaMemcpyDeviceToHost))
     return result
@@ -644,7 +644,7 @@ cdef np.ndarray _binary_op_host(np.ndarray a, np.ndarray b,
         ret = kernel(<float*>d_a.ptr, <float*>d_b.ptr, <float*>d_c.ptr, n, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(a.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>a).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_c.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result
 
@@ -682,7 +682,7 @@ def cuda_adds(np.ndarray a not None, float scalar):
         ret = cuda_adds_f32(<float*>d_a.ptr, scalar, <float*>d_c.ptr, n, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(a.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>a).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_c.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result
 
@@ -702,7 +702,7 @@ def cuda_muls(np.ndarray a not None, float scalar):
         ret = cuda_muls_f32(<float*>d_a.ptr, scalar, <float*>d_c.ptr, n, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(a.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>a).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_c.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result
 
@@ -740,8 +740,8 @@ def cuda_silu_fwd(np.ndarray x not None):
                                 <float*>d_sig.ptr, n, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(x.shape, dtype=np.float32)
-    cdef np.ndarray sig = np.empty(x.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>x).shape, dtype=np.float32)
+    cdef np.ndarray sig = np.empty((<object>x).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_y.ptr, nbytes, cudaMemcpyDeviceToHost))
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(sig), d_sig.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result, sig
@@ -762,7 +762,7 @@ def cuda_clamp(np.ndarray x not None, float lo, float hi):
         ret = cuda_clamp_f32(<float*>d_x.ptr, <float*>d_y.ptr, lo, hi, n, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(x.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>x).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_y.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result
 
@@ -1138,8 +1138,8 @@ def cuda_dropout(np.ndarray x not None, float p, unsigned long long seed=0):
                                p, n, seed, _default_stream)
     _check_kernel(ret)
 
-    cdef np.ndarray result = np.empty(x.shape, dtype=np.float32)
-    cdef np.ndarray mask = np.empty(x.shape, dtype=np.float32)
+    cdef np.ndarray result = np.empty((<object>x).shape, dtype=np.float32)
+    cdef np.ndarray mask = np.empty((<object>x).shape, dtype=np.float32)
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), d_y.ptr, nbytes, cudaMemcpyDeviceToHost))
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(mask), d_mask.ptr, nbytes, cudaMemcpyDeviceToHost))
     return result, mask
