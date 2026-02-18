@@ -390,6 +390,13 @@ def _build_cuda_extension():
 
     cuda_ops_src = '_cuda_ops.pyx' if USE_CYTHON else '_cuda_ops.c'
 
+    # If Cython is not installed and the pre-generated .c file doesn't
+    # exist, we cannot build.
+    if not os.path.isfile(cuda_ops_src):
+        print(f'[scaffolding] Skipping _cuda_ops — {cuda_ops_src} not found. '
+              f'Install Cython (pip install cython) to compile from .pyx.')
+        return None
+
     compile_args = ['-O3']
     if not IS_WINDOWS:
         compile_args.append('-ffast-math')
