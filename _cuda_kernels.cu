@@ -1423,12 +1423,11 @@ extern "C" int cuda_copy_f32(const float* src, float* dst, int64_t n, cudaStream
 /* ================================================================
  *  DROPOUT WITH cuRAND
  *
- *  K80 optimisation: __launch_bounds__ for occupancy hint.
+ *  Note: No __launch_bounds__ here — cuRAND Philox state is very
+ *  register-heavy (~40+ regs), so forcing min blocks would cause
+ *  excessive spilling or launch failure.
  * ================================================================ */
 
-#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
-__launch_bounds__(128, 16)
-#endif
 __global__ void dropout_f32_kernel(const float* __restrict__ x,
                                    float* __restrict__ y,
                                    float* __restrict__ mask,
