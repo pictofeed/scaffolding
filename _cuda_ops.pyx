@@ -271,7 +271,7 @@ cdef inline void _check_cuda(cudaError_t err) except *:
 
 cdef inline void _check_kernel(int ret) except *:
     if ret != 0:
-        raise RuntimeError("CUDA kernel launch failed")
+        raise RuntimeError("CUDA kernel launch failed with ret code %d" % ret)
 
 
 # ================================================================
