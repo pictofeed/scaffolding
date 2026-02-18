@@ -410,12 +410,13 @@ class LayerNorm(Module):
     def forward(self, x: Tensor) -> Tensor:
         # CUDA fast-path (GPU-resident)
         if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            _target_dev = x._device._index if x._device._index is not None else 0
             if self.weight is not None and self.weight._gpu is None:
                 self.weight._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(self.weight._data))
+                    np.ascontiguousarray(self.weight._data), _target_dev)
             if self.bias is not None and self.bias._gpu is None:
                 self.bias._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(self.bias._data))
+                    np.ascontiguousarray(self.bias._data), _target_dev)
             # Reshape to 2D for kernel
             orig_shape = x._gpu.shape
             D = self.normalized_shape[-1]
@@ -475,9 +476,10 @@ class RMSNorm(Module):
     def forward(self, x: Tensor) -> Tensor:
         # CUDA fast-path (GPU-resident)
         if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
+            _target_dev = x._device._index if x._device._index is not None else 0
             if self.weight._gpu is None:
                 self.weight._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(self.weight._data))
+                    np.ascontiguousarray(self.weight._data), _target_dev)
             orig_shape = x._gpu.shape
             D = self.normalized_shape[-1]
             N = x._gpu.numel // D

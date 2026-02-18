@@ -825,7 +825,8 @@ class Tensor:
         t = Tensor._wrap(result_data, rg, grad_fn, self._device)
         # Re-upload to GPU if we're on CUDA
         if _USE_CUDA and _is_cuda(self._device) and t._data.dtype == np.float32:
-            t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data))
+            _dev = self._device._index if self._device._index is not None else 0
+            t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data), _dev)
         return t
 
     def permute(self, *dims) -> 'Tensor':
@@ -1127,7 +1128,8 @@ def _make_tensor(arr: np.ndarray, requires_grad: bool, device: Device) -> Tensor
     """Create a Tensor, auto-uploading to GPU if device is CUDA."""
     t = Tensor._wrap(arr, requires_grad, None, device)
     if _USE_CUDA and _is_cuda(device) and arr.dtype in (np.float32, np.int64):
-        t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr))
+        _dev = device._index if device._index is not None else 0
+        t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), _dev)
     return t
 
 
