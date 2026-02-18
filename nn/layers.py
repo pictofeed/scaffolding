@@ -350,7 +350,7 @@ class LayerNorm(Module):
         if _USE_CUDA and _is_cuda(x._device):
             gamma = self.weight._data if self.weight is not None else None
             beta = self.bias._data if self.bias is not None else None
-            y, _mean, _rstd = _cuops.cuda_layer_norm(
+            y = _cuops.cuda_layer_norm(
                 x._data.reshape(-1, self.normalized_shape[-1]),
                 gamma, beta, self.eps,
             )
@@ -391,7 +391,7 @@ class RMSNorm(Module):
         # CUDA fast-path
         if _USE_CUDA and _is_cuda(x._device):
             gamma = self.weight._data
-            y, _rstd = _cuops.cuda_rms_norm(
+            y = _cuops.cuda_rms_norm(
                 x._data.reshape(-1, self.normalized_shape[-1]),
                 gamma, self.eps,
             )
