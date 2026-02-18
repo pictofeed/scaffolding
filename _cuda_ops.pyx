@@ -458,8 +458,9 @@ cdef bint _cublas_init = False
 
 cdef cublasHandle_t _get_cublas() except *:
     global _cublas_handle, _cublas_init
+    cdef cublasStatus_t status
     if not _cublas_init:
-        cdef cublasStatus_t status = cublasCreate(&_cublas_handle)
+        status = cublasCreate(&_cublas_handle)
         if status != CUBLAS_STATUS_SUCCESS:
             raise RuntimeError(f"cuBLAS init failed: {status}")
         _cublas_init = True
