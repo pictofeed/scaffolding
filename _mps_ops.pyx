@@ -200,18 +200,14 @@ cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm(
     cdef int N = b.shape[1]
     cdef float alpha = 1.0
     cdef float beta  = 0.0
-    cdef float *out = <float *>malloc(M * N * sizeof(float))
-    if out == NULL:
-        raise MemoryError("blas_sgemm: allocation failed")
+    cdef np.ndarray result = np.empty((M, N), dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     M, N, K, alpha,
                     &a[0, 0], K,
                     &b[0, 0], N,
                     beta, out, N)
-    result = np.empty((M, N), dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(float))
-    free(out)
     return result
 
 
@@ -228,18 +224,14 @@ cpdef np.ndarray[FLOAT64, ndim=2] blas_dgemm(
     cdef int N = b.shape[1]
     cdef double alpha = 1.0
     cdef double beta  = 0.0
-    cdef double *out = <double *>malloc(M * N * sizeof(double))
-    if out == NULL:
-        raise MemoryError("blas_dgemm: allocation failed")
+    cdef np.ndarray result = np.empty((M, N), dtype=np.float64)
+    cdef double *out = <double *>np.PyArray_DATA(result)
     with nogil:
         cblas_dgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
                     M, N, K, alpha,
                     &a[0, 0], K,
                     &b[0, 0], N,
                     beta, out, N)
-    result = np.empty((M, N), dtype=np.float64)
-    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(double))
-    free(out)
     return result
 
 
@@ -257,18 +249,14 @@ cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm_nt(
     cdef int N = b.shape[0]
     cdef float alpha = 1.0
     cdef float beta  = 0.0
-    cdef float *out = <float *>malloc(M * N * sizeof(float))
-    if out == NULL:
-        raise MemoryError("blas_sgemm_nt: allocation failed")
+    cdef np.ndarray result = np.empty((M, N), dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
                     M, N, K, alpha,
                     &a[0, 0], K,
                     &b[0, 0], K,
                     beta, out, N)
-    result = np.empty((M, N), dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(float))
-    free(out)
     return result
 
 
@@ -286,18 +274,14 @@ cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm_tn(
     cdef int N = b.shape[1]
     cdef float alpha = 1.0
     cdef float beta  = 0.0
-    cdef float *out = <float *>malloc(M * N * sizeof(float))
-    if out == NULL:
-        raise MemoryError("blas_sgemm_tn: allocation failed")
+    cdef np.ndarray result = np.empty((M, N), dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
                     M, N, K, alpha,
                     &a[0, 0], M,
                     &b[0, 0], N,
                     beta, out, N)
-    result = np.empty((M, N), dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(float))
-    free(out)
     return result
 
 
@@ -310,14 +294,10 @@ cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm_tn(
 cpdef np.ndarray[FLOAT32, ndim=1] veclib_expf(FLOAT32[::1] x):
     """Element-wise exp via vecLib vvexpf (float32)."""
     cdef int n = x.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("veclib_expf: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vvexpf(out, &x[0], &n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -326,14 +306,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] veclib_expf(FLOAT32[::1] x):
 cpdef np.ndarray[FLOAT64, ndim=1] veclib_exp(FLOAT64[::1] x):
     """Element-wise exp via vecLib vvexp (float64)."""
     cdef int n = x.shape[0]
-    cdef double *out = <double *>malloc(n * sizeof(double))
-    if out == NULL:
-        raise MemoryError("veclib_exp: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float64)
+    cdef double *out = <double *>np.PyArray_DATA(result)
     with nogil:
         vvexp(out, &x[0], &n)
-    result = np.empty(n, dtype=np.float64)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(double))
-    free(out)
     return result
 
 
@@ -342,14 +318,10 @@ cpdef np.ndarray[FLOAT64, ndim=1] veclib_exp(FLOAT64[::1] x):
 cpdef np.ndarray[FLOAT32, ndim=1] veclib_logf(FLOAT32[::1] x):
     """Element-wise log via vecLib vvlogf (float32)."""
     cdef int n = x.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("veclib_logf: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vvlogf(out, &x[0], &n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -358,14 +330,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] veclib_logf(FLOAT32[::1] x):
 cpdef np.ndarray[FLOAT32, ndim=1] veclib_sqrtf(FLOAT32[::1] x):
     """Element-wise sqrt via vecLib vvsqrtf (float32)."""
     cdef int n = x.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("veclib_sqrtf: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vvsqrtf(out, &x[0], &n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -374,14 +342,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] veclib_sqrtf(FLOAT32[::1] x):
 cpdef np.ndarray[FLOAT32, ndim=1] veclib_tanhf(FLOAT32[::1] x):
     """Element-wise tanh via vecLib vvtanhf (float32)."""
     cdef int n = x.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("veclib_tanhf: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vvtanhf(out, &x[0], &n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -395,14 +359,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vmul_f32(
         FLOAT32[::1] a, FLOAT32[::1] b):
     """Element-wise multiply via vDSP_vmul (float32)."""
     cdef unsigned long n = a.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("vdsp_vmul_f32: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vDSP_vmul(&a[0], 1, &b[0], 1, out, 1, n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -412,14 +372,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vadd_f32(
         FLOAT32[::1] a, FLOAT32[::1] b):
     """Element-wise add via vDSP_vadd (float32)."""
     cdef unsigned long n = a.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("vdsp_vadd_f32: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vDSP_vadd(&a[0], 1, &b[0], 1, out, 1, n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -429,14 +385,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vsmul_f32(
         FLOAT32[::1] a, float scalar):
     """Scalar multiply via vDSP_vsmul (float32)."""
     cdef unsigned long n = a.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("vdsp_vsmul_f32: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vDSP_vsmul(&a[0], 1, &scalar, out, 1, n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -446,14 +398,10 @@ cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vsadd_f32(
         FLOAT32[::1] a, float scalar):
     """Scalar add via vDSP_vsadd (float32)."""
     cdef unsigned long n = a.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("vdsp_vsadd_f32: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vDSP_vsadd(&a[0], 1, &scalar, out, 1, n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -492,14 +440,10 @@ cpdef float vdsp_max_f32(FLOAT32[::1] x) nogil:
 cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vsq_f32(FLOAT32[::1] x):
     """Element-wise square via vDSP_vsq (float32)."""
     cdef unsigned long n = x.shape[0]
-    cdef float *out = <float *>malloc(n * sizeof(float))
-    if out == NULL:
-        raise MemoryError("vdsp_vsq_f32: allocation failed")
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     with nogil:
         vDSP_vsq(&x[0], 1, out, 1, n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(out)
     return result
 
 
@@ -526,12 +470,13 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_sigmoid_1d(
     cdef int n = x.shape[0]
     cdef float *neg = <float *>malloc(n * sizeof(float))
     cdef float *ex  = <float *>malloc(n * sizeof(float))
-    cdef float *out = <float *>malloc(n * sizeof(float))
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     cdef float one = 1.0
     cdef unsigned long un = <unsigned long>n
     cdef Py_ssize_t i
-    if neg == NULL or ex == NULL or out == NULL:
-        free(neg); free(ex); free(out)
+    if neg == NULL or ex == NULL:
+        free(neg); free(ex)
         raise MemoryError("accelerate_sigmoid_1d: allocation failed")
     with nogil:
         # negate
@@ -542,9 +487,7 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_sigmoid_1d(
         vDSP_vsadd(ex, 1, &one, ex, 1, un)
         # 1 / (1 + exp(-x))
         vvrecf(out, ex, &n)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(neg); free(ex); free(out)
+    free(neg); free(ex)
     return result
 
 
@@ -557,11 +500,12 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_silu_1d(
     cdef float *neg = <float *>malloc(n * sizeof(float))
     cdef float *ex  = <float *>malloc(n * sizeof(float))
     cdef float *sig = <float *>malloc(n * sizeof(float))
-    cdef float *out = <float *>malloc(n * sizeof(float))
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     cdef float one = 1.0
     cdef unsigned long un = <unsigned long>n
-    if neg == NULL or ex == NULL or sig == NULL or out == NULL:
-        free(neg); free(ex); free(sig); free(out)
+    if neg == NULL or ex == NULL or sig == NULL:
+        free(neg); free(ex); free(sig)
         raise MemoryError("accelerate_silu_1d: allocation failed")
     with nogil:
         vDSP_vneg(&x[0], 1, neg, 1, un)
@@ -569,9 +513,7 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_silu_1d(
         vDSP_vsadd(ex, 1, &one, ex, 1, un)
         vvrecf(sig, ex, &n)
         vDSP_vmul(&x[0], 1, sig, 1, out, 1, un)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(neg); free(ex); free(sig); free(out)
+    free(neg); free(ex); free(sig)
     return result
 
 
@@ -584,14 +526,15 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_gelu_1d(
     cdef float *x3    = <float *>malloc(n * sizeof(float))
     cdef float *inner = <float *>malloc(n * sizeof(float))
     cdef float *th    = <float *>malloc(n * sizeof(float))
-    cdef float *out   = <float *>malloc(n * sizeof(float))
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     cdef unsigned long un = <unsigned long>n
     cdef float coeff = 0.044715
     cdef float scale = 0.7978845608  # sqrt(2/pi)
     cdef float one = 1.0
     cdef float half = 0.5
-    if x3 == NULL or inner == NULL or th == NULL or out == NULL:
-        free(x3); free(inner); free(th); free(out)
+    if x3 == NULL or inner == NULL or th == NULL:
+        free(x3); free(inner); free(th)
         raise MemoryError("accelerate_gelu_1d: allocation failed")
     with nogil:
         # x^3
@@ -611,10 +554,48 @@ cpdef np.ndarray[FLOAT32, ndim=1] accelerate_gelu_1d(
         vDSP_vsmul(&x[0], 1, &half, out, 1, un)
         # 0.5 * x * (1 + tanh(...))
         vDSP_vmul(out, 1, th, 1, out, 1, un)
-    result = np.empty(n, dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, n * sizeof(float))
-    free(x3); free(inner); free(th); free(out)
+    free(x3); free(inner); free(th)
     return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] accelerate_relu_1d(FLOAT32[::1] x):
+    """ReLU via vDSP_vclip: clamp to [0, FLT_MAX]."""
+    cdef unsigned long n = x.shape[0]
+    cdef float lo = 0.0
+    cdef float hi = 3.4028235e+38
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vDSP_vclip(&x[0], 1, &lo, &hi, out, 1, n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef tuple accelerate_silu_1d_fwd(FLOAT32[::1] x):
+    """SiLU forward returning (result, sigmoid) for backward reuse."""
+    cdef int n = x.shape[0]
+    cdef float *neg = <float *>malloc(n * sizeof(float))
+    cdef float *ex  = <float *>malloc(n * sizeof(float))
+    cdef np.ndarray sig_arr = np.empty(n, dtype=np.float32)
+    cdef float *sig = <float *>np.PyArray_DATA(sig_arr)
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef float one = 1.0
+    cdef unsigned long un = <unsigned long>n
+    if neg == NULL or ex == NULL:
+        free(neg); free(ex)
+        raise MemoryError("accelerate_silu_1d_fwd: allocation failed")
+    with nogil:
+        vDSP_vneg(&x[0], 1, neg, 1, un)
+        vvexpf(ex, neg, &n)
+        vDSP_vsadd(ex, 1, &one, ex, 1, un)
+        vvrecf(sig, ex, &n)
+        vDSP_vmul(&x[0], 1, sig, 1, out, 1, un)
+    free(neg); free(ex)
+    return (result, sig_arr)
 
 
 @cython.boundscheck(False)
@@ -627,13 +608,13 @@ cpdef np.ndarray[FLOAT32, ndim=2] accelerate_rms_norm_2d(
     """
     cdef int N = x.shape[0]
     cdef int D = x.shape[1]
-    cdef float *out = <float *>malloc(N * D * sizeof(float))
+    cdef np.ndarray result = np.empty((N, D), dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     cdef float *row_sq = <float *>malloc(D * sizeof(float))
     cdef unsigned long uD = <unsigned long>D
     cdef Py_ssize_t i
     cdef float mean_sq, rms
-    if out == NULL or row_sq == NULL:
-        free(out); free(row_sq)
+    if row_sq == NULL:
         raise MemoryError("accelerate_rms_norm_2d: allocation failed")
     with nogil:
         for i in range(N):
@@ -647,9 +628,7 @@ cpdef np.ndarray[FLOAT32, ndim=2] accelerate_rms_norm_2d(
             vDSP_vsmul(&x[i, 0], 1, &rms, &out[i * D], 1, uD)
             # * weight
             vDSP_vmul(&out[i * D], 1, &weight[0], 1, &out[i * D], 1, uD)
-    result = np.empty((N, D), dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, N * D * sizeof(float))
-    free(out); free(row_sq)
+    free(row_sq)
     return result
 
 
@@ -663,13 +642,12 @@ cpdef np.ndarray[FLOAT32, ndim=2] accelerate_softmax_2d(
     """
     cdef int N = x.shape[0]
     cdef int C = x.shape[1]
-    cdef float *out = <float *>malloc(N * C * sizeof(float))
+    cdef np.ndarray result = np.empty((N, C), dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
     cdef unsigned long uC = <unsigned long>C
     cdef int cC = C
     cdef Py_ssize_t i
     cdef float row_max, row_sum, neg_max
-    if out == NULL:
-        raise MemoryError("accelerate_softmax_2d: allocation failed")
     with nogil:
         for i in range(N):
             # max for numerical stability
@@ -684,9 +662,6 @@ cpdef np.ndarray[FLOAT32, ndim=2] accelerate_softmax_2d(
             # divide by sum (vDSP_vsdiv = vsmul by 1/sum)
             row_sum = 1.0 / row_sum
             vDSP_vsmul(&out[i * C], 1, &row_sum, &out[i * C], 1, uC)
-    result = np.empty((N, C), dtype=np.float32)
-    memcpy(np.PyArray_DATA(result), out, N * C * sizeof(float))
-    free(out)
     return result
 
 
@@ -838,6 +813,26 @@ def accelerate_silu(np.ndarray x not None):
     return x * sig
 
 
+def accelerate_silu_fwd(np.ndarray x not None):
+    """SiLU forward returning (result, sigmoid) for backward reuse."""
+    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef tuple shape = (<object>x).shape
+    if flat.dtype == np.float32:
+        res, sig = accelerate_silu_1d_fwd(flat)
+        return res.reshape(shape), sig.reshape(shape)
+    sig = 1.0 / (1.0 + np.exp(-x))
+    return x * sig, sig
+
+
+def accelerate_relu(np.ndarray x not None):
+    """ReLU dispatch via vDSP_vclip."""
+    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef tuple shape = (<object>x).shape
+    if flat.dtype == np.float32:
+        return accelerate_relu_1d(flat).reshape(shape)
+    return np.maximum(x, 0)
+
+
 def accelerate_rms_norm(np.ndarray x not None, np.ndarray weight not None,
                          float eps):
     """RMS norm dispatch."""
@@ -950,40 +945,36 @@ def accelerate_adamw_step(np.ndarray param not None,
         param -= lr * m_hat / (np.sqrt(v_hat) + eps)
 
 
-def accelerate_batched_matmul(np.ndarray a not None, np.ndarray b not None):
-    """Batched matmul using Accelerate BLAS for each 2D slice.
-    
-    Handles arbitrary batch dimensions. Falls back to np.matmul for
-    non-float32 or 1D cases.
-    """
+def accelerate_batched_matmul(a, b):
+    """Batched matmul using Accelerate BLAS for each 2D slice."""
     if a.dtype != np.float32 or b.dtype != np.float32:
         return np.matmul(a, b)
     if a.ndim == 2 and b.ndim == 2:
         return <object>blas_sgemm(np.ascontiguousarray(a), np.ascontiguousarray(b))
     if a.ndim < 2 or b.ndim < 2:
         return np.matmul(a, b)
-    
-    # Broadcast batch dimensions
-    cdef tuple a_shape = (<object>a).shape
-    cdef tuple b_shape = (<object>b).shape
-    cdef int M = a_shape[-2]
-    cdef int K = a_shape[-1]
-    cdef int N = b_shape[-1]
-    
-    # Reshape to 3D: (batch, M, K) and (batch, K, N)
+
+    a_shape = a.shape
+    b_shape = b.shape
+    a_nd = len(a_shape)
+    b_nd = len(b_shape)
+    M = int(a_shape[a_nd - 2])
+    K = int(a_shape[a_nd - 1])
+    N = int(b_shape[b_nd - 1])
+
     batch_a = a.reshape(-1, M, K)
     if b.ndim == a.ndim:
         batch_b = b.reshape(-1, K, N)
     else:
-        batch_b = np.broadcast_to(b, a_shape[:-2] + b_shape[-2:]).reshape(-1, K, N)
-    
-    cdef int batch_size = batch_a.shape[0]
+        batch_b = np.broadcast_to(b, a_shape[:a_nd - 2] + b_shape[b_nd - 2:]).reshape(-1, K, N)
+
+    batch_size = int(batch_a.shape[0])
     result = np.empty((batch_size, M, N), dtype=np.float32)
-    
-    cdef int i
+
     for i in range(batch_size):
+        bi = i if i < batch_b.shape[0] else 0
         result[i] = <object>blas_sgemm(
             np.ascontiguousarray(batch_a[i]),
-            np.ascontiguousarray(batch_b[i if i < batch_b.shape[0] else 0]))
-    
-    return result.reshape(a_shape[:-1] + (N,))
+            np.ascontiguousarray(batch_b[bi]))
+
+    return result.reshape(a_shape[:a_nd - 1] + (N,))

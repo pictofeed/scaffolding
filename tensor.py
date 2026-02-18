@@ -952,9 +952,9 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
         b_data = b._data
         if a_data.ndim >= 2 and b_data.ndim >= 2 and a_data.dtype == np.float32:
             if a_data.ndim == 2 and b_data.ndim == 2:
-                result_data = _mops.blas_sgemm(
-                    np.ascontiguousarray(a_data),
-                    np.ascontiguousarray(b_data))
+                a_c = a_data if a_data.flags.c_contiguous else np.ascontiguousarray(a_data)
+                b_c = b_data if b_data.flags.c_contiguous else np.ascontiguousarray(b_data)
+                result_data = _mops.blas_sgemm(a_c, b_c)
             else:
                 result_data = _mops.accelerate_batched_matmul(a_data, b_data)
         else:

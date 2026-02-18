@@ -351,10 +351,12 @@ class SiluBackward(GradFn):
 
     def backward(self, g):
         x = self.saved['x']
-        if _USE_MPS and x.dtype == np.float32:
-            s = _mops.accelerate_sigmoid(x)
-        else:
-            s = 1.0 / (1.0 + np.exp(-x))
+        s = self.saved.get('sigmoid', None)
+        if s is None:
+            if _USE_MPS and x.dtype == np.float32:
+                s = _mops.accelerate_sigmoid(x)
+            else:
+                s = 1.0 / (1.0 + np.exp(-x))
         return (g * (s + x * s * (1.0 - s)),)
 
 
@@ -374,7 +376,25 @@ class ReluBackward(GradFn):
         super().__init__('ReluBackward')
 
     def backward(self, g):
-        return (g * (self.saved['x'] > 0).astype(g.dtype),)
+        mask = self.saved.get('mask', None)
+        if mask is None:
+            mask = self.saved['x'] > 0
+        return (g * mask,)
+
+
+class GeluBackward(GradFn):
+    def __init__(self):
+        super().__init__('GeluBackward')
+
+    def backward(self, g):
+        x = self.saved['x']
+        s2pi = 0.7978845608  # sqrt(2/pi)
+        inner = s2pi * (x + 0.044715 * x ** 3)
+        t = np.tanh(inner)
+        dtanh = 1.0 - t * t
+        dinner = s2pi * (1.0 + 3.0 * 0.044715 * x * x)
+        grad_x = 0.5 * (1.0 + t) + 0.5 * x * dtanh * dinner
+        return (g * grad_x,)
 
 
 class SinBackward(GradFn):

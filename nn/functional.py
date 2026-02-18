@@ -15,35 +15,39 @@ from .. import autograd as _ag
 # ──────────────────────── Activations ─────────────────────────────────
 
 def relu(input: Tensor, inplace: bool = False) -> Tensor:
-    result_data = np.maximum(input._data, 0)
+    if _USE_MPS and input._data.dtype == np.float32:
+        result_data = _mops.accelerate_relu(input._data)
+    else:
+        result_data = np.maximum(input._data, 0)
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
         grad_fn = _ag.ReluBackward()
         grad_fn.inputs = [input]
-        grad_fn.saved = {'x': input._data}
+        grad_fn.saved = {'mask': (input._data > 0)}
     return Tensor._wrap(result_data, rg, grad_fn, input._device)
 
 
 def silu(input: Tensor) -> Tensor:
     if _USE_MPS:
-        result_data = _mops.accelerate_silu(input._data)
+        result_data, sig_data = _mops.accelerate_silu_fwd(input._data)
     elif _USE_CYTHON:
         flat = np.ascontiguousarray(input._data).ravel()
         if flat.dtype == np.float32:
             result_data = _cops.silu_1d_f32(flat).reshape(input._data.shape)
+            sig_data = None
         else:
-            sig = 1.0 / (1.0 + np.exp(-input._data))
-            result_data = input._data * sig
+            sig_data = 1.0 / (1.0 + np.exp(-input._data))
+            result_data = input._data * sig_data
     else:
-        sig = 1.0 / (1.0 + np.exp(-input._data))
-        result_data = input._data * sig
+        sig_data = 1.0 / (1.0 + np.exp(-input._data))
+        result_data = input._data * sig_data
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
         grad_fn = _ag.SiluBackward()
         grad_fn.inputs = [input]
-        grad_fn.saved = {'x': input._data}
+        grad_fn.saved = {'x': input._data, 'sigmoid': sig_data}
     return Tensor._wrap(result_data, rg, grad_fn, input._device)
 
 
@@ -54,7 +58,13 @@ def gelu(input: Tensor) -> Tensor:
         x = input._data
         result_data = 0.5 * x * (1 + np.tanh(
             math.sqrt(2.0 / math.pi) * (x + 0.044715 * x ** 3)))
-    return Tensor._wrap(result_data, input._requires_grad, None, input._device)
+    rg = input._requires_grad and _ag.is_grad_enabled()
+    grad_fn = None
+    if rg:
+        grad_fn = _ag.GeluBackward()
+        grad_fn.inputs = [input]
+        grad_fn.saved = {'x': input._data}
+    return Tensor._wrap(result_data, rg, grad_fn, input._device)
 
 
 def sigmoid(input: Tensor) -> Tensor:
@@ -130,12 +140,24 @@ def cross_entropy(input: Tensor, target: Tensor,
         t = t.reshape(-1)
 
     N = x.shape[0]
-    # Stable softmax - fused with fewer temporaries
-    x_max = x.max(axis=-1, keepdims=True)
-    e = np.exp(x - x_max)
-    e_sum = e.sum(axis=-1, keepdims=True)
-    np.divide(e, e_sum, out=e)
-    probs = e
+    rg = input._requires_grad and _ag.is_grad_enabled()
+
+    # Fast path: fully fused Accelerate kernel (no grad needed)
+    if _USE_MPS and x.dtype == np.float32 and reduction == 'mean' and not rg:
+        loss_val = _mops.accelerate_cross_entropy(
+            np.ascontiguousarray(x),
+            np.ascontiguousarray(t).astype(np.int64))
+        return Tensor._wrap(np.float32(loss_val), False, None, input._device)
+
+    # Compute softmax (use Accelerate if available)
+    if _USE_MPS and x.dtype == np.float32:
+        probs = _mops.accelerate_softmax(np.ascontiguousarray(x), -1)
+    else:
+        x_max = x.max(axis=-1, keepdims=True)
+        e = np.exp(x - x_max)
+        e_sum = e.sum(axis=-1, keepdims=True)
+        np.divide(e, e_sum, out=e)
+        probs = e
 
     # NLL - avoid full log computation, only need selected entries
     selected_probs = probs[np.arange(N), t]
@@ -148,7 +170,6 @@ def cross_entropy(input: Tensor, target: Tensor,
     else:
         result_data = losses
 
-    rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
         grad_fn = _ag.CrossEntropyBackward()
