@@ -1,5 +1,5 @@
 <div align="center">
-    <img src="img/scaffolding-logo.png" alt="Scaffolding Logo" width="180"/>
+    <img src="img/scaffolding-logo.png" alt="Scaffolding Logo" width="500"/>
 </div>
 
 # Scaffolding
