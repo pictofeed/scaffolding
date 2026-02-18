@@ -136,7 +136,7 @@ cdef extern from "cublas_v2.h" nogil:
 #  CUDA kernel function declarations (from _cuda_kernels.cu)
 # ================================================================
 
-cdef extern from "_cuda_kernels.cuh" nogil:
+cdef extern from "_cuda_ops_decl.h" nogil:
     # --- Element-wise unary ---
     int cuda_exp_f32(const float* x, float* y, int64_t n, cudaStream_t stream)
     int cuda_log_f32(const float* x, float* y, int64_t n, cudaStream_t stream)

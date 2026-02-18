@@ -25,7 +25,12 @@
 #include <cuda_runtime.h>
 #include <cuda.h>
 #include <cublas_v2.h>
-#include <curand_kernel.h>
+
+/* curand_kernel.h contains C++ overloads / templates — only include
+ * when compiling with nvcc (which is a C++ compiler). */
+#if defined(__CUDACC__)
+  #include <curand_kernel.h>
+#endif
 
 /* ---------- Half / BFloat16 headers (version-gated) ---------- */
 #if defined(__CUDACC__)
@@ -39,6 +44,12 @@
 #include <math.h>
 #include <float.h>
 #include <stdio.h>
+
+/* Everything below this point uses CUDA device intrinsics (__device__,
+ * __shared__, __syncthreads, etc.) and is only valid when compiled by
+ * nvcc.  The plain-C declarations that the Cython bindings need live
+ * in _cuda_ops_decl.h, which is safe for gcc/clang. */
+#if defined(__CUDACC__)
 
 /* ================================================================
  *  VERSION COMPATIBILITY MACROS
@@ -108,10 +119,16 @@ static inline int ceildiv(int64_t n, int block) {
 }
 
 /* Cap grid size to avoid over-subscription */
-static inline int grid_size(int64_t n, int block, int max_blocks = 65535) {
+static inline int _grid_size_impl(int64_t n, int block, int max_blocks) {
     int g = ceildiv(n, block);
     return g < max_blocks ? g : max_blocks;
 }
+
+/* Allow grid_size(n, block) and grid_size(n, block, max_blocks) */
+#define _GS3(n, block, max) _grid_size_impl((n), (block), (max))
+#define _GS2(n, block)      _grid_size_impl((n), (block), 65535)
+#define _GS_SEL(_1, _2, _3, NAME, ...) NAME
+#define grid_size(...) _GS_SEL(__VA_ARGS__, _GS3, _GS2)(__VA_ARGS__)
 
 /* ================================================================
  *  FAST MATH DEVICE FUNCTIONS
@@ -337,5 +354,7 @@ int cuda_transpose_2d_f32(const float* in, float* out, int rows, int cols,
                           cudaStream_t stream);
 
 }  /* extern "C" */
+
+#endif /* __CUDACC__ */
 
 #endif /* SCAFFOLDING_CUDA_KERNELS_CUH */
