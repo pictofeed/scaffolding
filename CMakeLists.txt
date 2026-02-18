@@ -177,10 +177,17 @@ function(add_cython_extension target_name pyx_source)
 endfunction()
 
 
-# ── Extension 1: _tensor_ops (generic CPU) ──
-add_cython_extension(scaffolding_tensor_ops
-    _tensor_ops.pyx
-)
+# ── Extension 1: _tensor_ops (generic CPU, macOS only) ──
+# On Linux the pre-generated .c is not shipped and the runtime
+# falls back to pure-NumPy / CUDA, so we only build on macOS.
+if(_IS_MACOS)
+    add_cython_extension(scaffolding_tensor_ops
+        _tensor_ops.pyx
+    )
+    message(STATUS "_tensor_ops extension: ENABLED (macOS)")
+else()
+    message(STATUS "_tensor_ops extension: DISABLED (not macOS)")
+endif()
 
 # ── Extension 2: _mps_ops (macOS Accelerate) ──
 if(SCAFFOLDING_USE_MPS)
@@ -250,10 +257,12 @@ set(_SCAFFOLDING_INSTALL_DIR
     "${Python3_SITEARCH}/scaffolding"
 )
 
-install(TARGETS scaffolding_tensor_ops
-    LIBRARY DESTINATION ${_SCAFFOLDING_INSTALL_DIR}
-    RUNTIME DESTINATION ${_SCAFFOLDING_INSTALL_DIR}
-)
+if(_IS_MACOS)
+    install(TARGETS scaffolding_tensor_ops
+        LIBRARY DESTINATION ${_SCAFFOLDING_INSTALL_DIR}
+        RUNTIME DESTINATION ${_SCAFFOLDING_INSTALL_DIR}
+    )
+endif()
 
 if(SCAFFOLDING_USE_MPS)
     install(TARGETS scaffolding_mps_ops

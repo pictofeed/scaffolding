@@ -234,24 +234,32 @@ class CudaBuildExt(_build_ext):
 
 
 # ══════════════════════════════════════════════════════════════════════
-#  Extension 1: _tensor_ops (generic CPU)
+#  Extension 1: _tensor_ops (generic CPU) — macOS only
+#  Extension 2: _mps_ops (macOS Accelerate) — macOS only
+#
+#  Both extensions depend on Cython + macOS toolchains.  On Linux the
+#  pre-generated .c files are not shipped, so we skip them entirely;
+#  the runtime imports in tensor.py / nn/ gracefully fall back to
+#  pure-NumPy or CUDA paths.
 # ══════════════════════════════════════════════════════════════════════
 
-tensor_ops_src = '_tensor_ops.pyx' if USE_CYTHON else '_tensor_ops.c'
-tensor_ops_ext = Extension(
-    name='scaffolding._tensor_ops',
-    sources=[tensor_ops_src],
-    include_dirs=[np.get_include()],
-    extra_compile_args=EXTRA_COMPILE_ARGS,
-    extra_link_args=EXTRA_LINK_ARGS,
-    language='c',
-)
+extensions: list[Extension] = []
 
-# ══════════════════════════════════════════════════════════════════════
-#  Extension 2: _mps_ops (macOS Accelerate)
-# ══════════════════════════════════════════════════════════════════════
-
-extensions = [tensor_ops_ext]
+if IS_MACOS:
+    tensor_ops_src = '_tensor_ops.pyx' if USE_CYTHON else '_tensor_ops.c'
+    # Only add if the source file actually exists
+    if os.path.isfile(tensor_ops_src):
+        tensor_ops_ext = Extension(
+            name='scaffolding._tensor_ops',
+            sources=[tensor_ops_src],
+            include_dirs=[np.get_include()],
+            extra_compile_args=EXTRA_COMPILE_ARGS,
+            extra_link_args=EXTRA_LINK_ARGS,
+            language='c',
+        )
+        extensions.append(tensor_ops_ext)
+    else:
+        print(f'[scaffolding] Skipping _tensor_ops — {tensor_ops_src} not found')
 
 if IS_MACOS:
     mps_ops_src = '_mps_ops.pyx' if USE_CYTHON else '_mps_ops.c'
