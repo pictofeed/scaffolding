@@ -322,6 +322,16 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_add(self._gpu, b._gpu),
                                         device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            if isinstance(other, (int, float)):
+                return Tensor._wrap(_mops.accelerate_adds(self._data, float(other)),
+                                    False, None, self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            b._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_add(self._data, b._data),
+                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data + other
@@ -355,6 +365,16 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_sub(self._gpu, b._gpu),
                                         device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            if isinstance(other, (int, float)):
+                return Tensor._wrap(_mops.accelerate_adds(self._data, -float(other)),
+                                    False, None, self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            b._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_sub(self._data, b._data),
+                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data - other
@@ -389,6 +409,16 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_mul(self._gpu, b._gpu),
                                         device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            if isinstance(other, (int, float)):
+                return Tensor._wrap(_mops.accelerate_muls(self._data, float(other)),
+                                    False, None, self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            b._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_mul(self._data, b._data),
+                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data * other
@@ -424,6 +454,16 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_div(self._gpu, b._gpu),
                                         device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            if isinstance(other, (int, float)):
+                return Tensor._wrap(_mops.accelerate_muls(self._data, 1.0 / float(other)),
+                                    False, None, self._device)
+            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+            b._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_div(self._data, b._data),
+                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data / other
@@ -454,6 +494,11 @@ class Tensor:
         # GPU-resident fast path
         if self._gpu is not None:
             return Tensor._wrap_gpu(_cuops.dev_neg(self._gpu), device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_neg(self._data),
+                                False, None, self._device)
         self._ensure_cpu()
         result_data = -self._data
         grad_fn = None
@@ -464,6 +509,15 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def __pow__(self, other):
+        # GPU-resident fast path (scalar exponent)
+        if self._gpu is not None and isinstance(other, (int, float)):
+            return Tensor._wrap_gpu(_cuops.dev_pow_scalar(self._gpu, float(other)),
+                                    device=self._device)
+        # MPS/Accelerate fast path (inference only, scalar exponent)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad and isinstance(other, (int, float)):
+            self._ensure_cpu()
+            return Tensor._wrap(_mops.accelerate_pow_scalar(self._data, float(other)),
+                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, Tensor):
             other._ensure_cpu()
@@ -532,6 +586,11 @@ class Tensor:
 
     # Indexing
     def __getitem__(self, key):
+        # GPU-resident fast path for simple contiguous slicing
+        if self._gpu is not None and not self._requires_grad:
+            gpu_result = self._try_gpu_getitem(key)
+            if gpu_result is not None:
+                return gpu_result
         self._ensure_cpu()
         if isinstance(key, Tensor):
             key._ensure_cpu()
@@ -546,6 +605,60 @@ class Tensor:
             grad_fn.inputs = [self]
             grad_fn.saved = {'input_shape': self._data.shape, 'key': key}
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
+
+    def _try_gpu_getitem(self, key):
+        """Try to handle __getitem__ on GPU. Returns None if not possible."""
+        shape = self._gpu.shape
+        ndim = len(shape)
+
+        # Normalize key to tuple
+        if not isinstance(key, tuple):
+            key = (key,)
+
+        # Handle Ellipsis: expand it
+        if Ellipsis in key:
+            eidx = key.index(Ellipsis)
+            n_explicit = sum(1 for k in key if k is not Ellipsis)
+            n_expand = ndim - n_explicit
+            key = key[:eidx] + (slice(None),) * n_expand + key[eidx+1:]
+
+        # Pad with slice(None) to ndim
+        if len(key) < ndim:
+            key = key + (slice(None),) * (ndim - len(key))
+
+        # Compute offset and output shape for contiguous slicing
+        offset = 0
+        out_shape = []
+        stride = 1
+        # Compute strides
+        strides = []
+        s = 1
+        for i in range(ndim - 1, -1, -1):
+            strides.insert(0, s)
+            s *= shape[i]
+
+        for i, k in enumerate(key):
+            if isinstance(k, int):
+                idx = k if k >= 0 else shape[i] + k
+                offset += idx * strides[i]
+                # No dim added to output (integer indexing)
+            elif isinstance(k, slice):
+                start, stop, step = k.indices(shape[i])
+                if step != 1:
+                    return None  # Non-unit step not supported
+                offset += start * strides[i]
+                out_shape.append(stop - start)
+            else:
+                return None  # Advanced indexing not supported
+
+        count = 1
+        for s in out_shape:
+            count *= s
+        if count == 0:
+            return None
+
+        result_gt = _cuops.dev_slice(self._gpu, offset, count, out_shape)
+        return Tensor._wrap_gpu(result_gt, device=self._device)
 
     def __setitem__(self, key, value):
         self._ensure_cpu()
@@ -718,6 +831,12 @@ class Tensor:
                 return Tensor._wrap_gpu(_cuops.dev_clamp(self._gpu, lo, hi), device=self._device)
             self._ensure_cpu()
             result_data = _cuops.cuda_clamp(self._data, lo, hi)
+        elif _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            lo = float(min) if min is not None else -3.4e38
+            hi = float(max) if max is not None else 3.4e38
+            result_data = _mops.accelerate_clamp(self._data, lo, hi)
+            return Tensor._wrap(result_data, False, None, self._device)
         else:
             self._ensure_cpu()
             result_data = np.clip(self._data, min, max)
@@ -732,6 +851,22 @@ class Tensor:
     # ---- Reduction methods ----
 
     def sum(self, dim=None, keepdim=False) -> 'Tensor':
+        # GPU-resident fast path
+        if self._gpu is not None and not self._requires_grad:
+            if dim is None:
+                # Global sum returning GpuTensor
+                return Tensor._wrap_gpu(_cuops.dev_sum_tensor(self._gpu),
+                                        device=self._device)
+            else:
+                return Tensor._wrap_gpu(_cuops.dev_sum_dim(self._gpu, int(dim), keepdim),
+                                        device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            result_data = _mops.accelerate_sum(self._data, dim=dim, keepdim=keepdim)
+            if isinstance(result_data, (float, int, np.floating)):
+                result_data = np.array(result_data, dtype=self._data.dtype)
+            return Tensor._wrap(result_data, False, None, self._device)
         self._ensure_cpu()
         result_data = np.sum(self._data, axis=dim, keepdims=keepdim)
         if isinstance(result_data, np.generic):
@@ -749,6 +884,22 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def mean(self, dim=None, keepdim=False) -> 'Tensor':
+        # GPU-resident fast path
+        if self._gpu is not None and not self._requires_grad:
+            if dim is None:
+                # Global mean returning GpuTensor
+                return Tensor._wrap_gpu(_cuops.dev_mean_tensor(self._gpu),
+                                        device=self._device)
+            else:
+                return Tensor._wrap_gpu(_cuops.dev_mean_dim(self._gpu, int(dim), keepdim),
+                                        device=self._device)
+        # MPS/Accelerate fast path (inference only)
+        if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
+            self._ensure_cpu()
+            result_data = _mops.accelerate_mean(self._data, dim=dim, keepdim=keepdim)
+            if isinstance(result_data, (float, int, np.floating)):
+                result_data = np.array(result_data, dtype=self._data.dtype)
+            return Tensor._wrap(result_data, False, None, self._device)
         self._ensure_cpu()
         result_data = np.mean(self._data, axis=dim, keepdims=keepdim)
         if isinstance(result_data, np.generic):
@@ -843,6 +994,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def unsqueeze(self, dim: int) -> 'Tensor':
+        # GPU-resident fast path (metadata-only, zero-copy)
+        if self._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_unsqueeze(self._gpu, dim),
+                                    device=self._device)
         self._ensure_cpu()
         result_data = np.expand_dims(self._data, axis=dim)
         grad_fn = None
@@ -854,6 +1009,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def squeeze(self, dim: int | None = None) -> 'Tensor':
+        # GPU-resident fast path (metadata-only, zero-copy)
+        if self._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_squeeze(self._gpu, dim),
+                                    device=self._device)
         self._ensure_cpu()
         if dim is not None:
             result_data = np.squeeze(self._data, axis=dim)
@@ -868,6 +1027,9 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def contiguous(self) -> 'Tensor':
+        # GPU-resident tensors are always contiguous (we copy on every op)
+        if self._gpu is not None:
+            return self
         self._ensure_cpu()
         if self._data.flags.c_contiguous:
             return self
@@ -875,6 +1037,10 @@ class Tensor:
                             self._requires_grad, self._grad_fn, self._device)
 
     def chunk(self, chunks: int, dim: int = 0) -> tuple['Tensor', ...]:
+        # GPU-resident fast path
+        if self._gpu is not None:
+            gpu_chunks = _cuops.dev_chunk(self._gpu, chunks, dim)
+            return tuple(Tensor._wrap_gpu(gc, device=self._device) for gc in gpu_chunks)
         self._ensure_cpu()
         arrays = np.array_split(self._data, chunks, axis=dim)
         results = []
@@ -896,6 +1062,10 @@ class Tensor:
         return self.reshape(*new_shape)
 
     def expand(self, *sizes) -> 'Tensor':
+        # GPU-resident fast path
+        if self._gpu is not None:
+            return Tensor._wrap_gpu(_cuops.dev_expand(self._gpu, sizes),
+                                    device=self._device)
         self._ensure_cpu()
         return Tensor._wrap(np.broadcast_to(self._data, sizes).copy(),
                             self._requires_grad, None, self._device)
@@ -1296,6 +1466,13 @@ def matmul_nt(a: Tensor, b: Tensor) -> Tensor:
 
 
 def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    # GPU-resident fast path
+    if tensors and tensors[0]._gpu is not None:
+        all_gpu = all(t._gpu is not None for t in tensors)
+        if all_gpu:
+            gpu_list = [t._gpu for t in tensors]
+            result_gt = _cuops.dev_cat(gpu_list, dim)
+            return Tensor._wrap_gpu(result_gt, device=tensors[0]._device)
     for t in tensors:
         t._ensure_cpu()
     arrays = [t._data for t in tensors]
@@ -1313,6 +1490,13 @@ def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
 
 
 def stack(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
+    # GPU-resident fast path
+    if tensors and tensors[0]._gpu is not None:
+        all_gpu = all(t._gpu is not None for t in tensors)
+        if all_gpu:
+            gpu_list = [t._gpu for t in tensors]
+            result_gt = _cuops.dev_stack(gpu_list, dim)
+            return Tensor._wrap_gpu(result_gt, device=tensors[0]._device)
     for t in tensors:
         t._ensure_cpu()
     arrays = [t._data for t in tensors]
@@ -1363,6 +1547,16 @@ def where(condition, x, y):
 
 
 def cumsum(input: Tensor, dim: int) -> Tensor:
+    # GPU-resident fast path
+    if input._gpu is not None:
+        return Tensor._wrap_gpu(_cuops.dev_cumsum(input._gpu, dim),
+                                device=input._device)
+    # MPS/Accelerate fast path (inference only)
+    if _USE_MPS and _is_mps(input._device) and not input._requires_grad:
+        input._ensure_cpu()
+        result_data = _mops.accelerate_cumsum(input._data, dim)
+        return Tensor._wrap(result_data, False, None, input._device)
+    input._ensure_cpu()
     result_data = np.cumsum(input._data, axis=dim)
     grad_fn = None
     rg = input._requires_grad and _ag.is_grad_enabled()

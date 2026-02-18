@@ -258,6 +258,32 @@ cdef extern from "_cuda_ops_decl.h" nogil:
     # --- TF32 control ---
     int cuda_set_tf32(cublasHandle_t handle, int enable)
 
+    # --- Strided copy ---
+    int cuda_strided_copy_f32(const float* src, float* dst,
+                              int64_t n, int64_t src_offset,
+                              int64_t dst_offset, cudaStream_t stream)
+
+    # --- Power (scalar exponent) ---
+    int cuda_pow_scalar_f32(const float* x, float* y,
+                            float exponent, int64_t n, cudaStream_t stream)
+
+    # --- Cumulative sum ---
+    int cuda_cumsum_f32(const float* x, float* y,
+                        int64_t outer, int64_t dim_size, int64_t inner,
+                        cudaStream_t stream)
+
+    # --- Mean along dim ---
+    int cuda_mean_dim_f32(const float* x, float* out,
+                          int64_t outer, int64_t dim_size, int64_t inner,
+                          cudaStream_t stream)
+
+    # --- Arange ---
+    int cuda_arange_f32(float* out, int64_t n, cudaStream_t stream)
+    int cuda_arange_i64(int64_t* out, int64_t n, cudaStream_t stream)
+
+    # --- Fill i64 ---
+    int cuda_fill_i64(int64_t* out, int64_t value, int64_t n, cudaStream_t stream)
+
 
 # ================================================================
 #  HELPER: Check CUDA errors
@@ -1349,6 +1375,404 @@ def dev_transpose_2d(gt):
         ret = cuda_transpose_2d_f32(<float*>src.ptr, <float*>dst.ptr, rows, cols, _default_stream)
     _check_kernel(ret)
     return GpuTensor(dst, (cols, rows), gt.dtype)
+
+
+# --- Power (scalar exponent) ---
+
+def dev_pow_scalar(gt, float exponent):
+    """Element-wise x ** exponent on device."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst = _gt_alloc(n, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_pow_scalar_f32(<float*>src.ptr, <float*>dst.ptr, exponent, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype, dev)
+
+
+# --- Unsqueeze / squeeze (metadata-only, zero-copy) ---
+
+def dev_unsqueeze(gt, int dim):
+    """Insert a size-1 dimension. Zero-copy — shares buffer."""
+    shape = list(gt.shape)
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + 1 + dim
+    shape.insert(dim, 1)
+    return GpuTensor(gt.buffer, tuple(shape), gt.dtype, gt.device_id)
+
+def dev_squeeze(gt, dim=None):
+    """Remove size-1 dimensions. Zero-copy — shares buffer."""
+    shape = list(gt.shape)
+    if dim is not None:
+        if dim < 0:
+            dim = len(shape) + dim
+        if 0 <= dim < len(shape) and shape[dim] == 1:
+            shape.pop(dim)
+    else:
+        shape = [s for s in shape if s != 1]
+    return GpuTensor(gt.buffer, tuple(shape), gt.dtype, gt.device_id)
+
+def dev_reshape(gt, new_shape):
+    """Reshape (contiguous only). Zero-copy — shares buffer."""
+    return GpuTensor(gt.buffer, tuple(new_shape), gt.dtype, gt.device_id)
+
+def dev_expand(gt, new_shape):
+    """Expand size-1 dims by repeating data. Requires actual copy for GPU."""
+    old_shape = gt.shape
+    ndim = len(new_shape)
+    # Pad old_shape to same ndim
+    old = list(old_shape)
+    while len(old) < ndim:
+        old.insert(0, 1)
+    # Compute total elements
+    cdef int64_t total = 1
+    cdef int64_t src_n = gt.numel
+    cdef int64_t reps = 0
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst
+    cdef CudaBuffer src0
+    cdef CudaBuffer src
+    cdef int ret0 = 0
+    cdef int ret1 = 0
+
+    for s in new_shape:
+        total *= s
+
+    dst = _gt_alloc(total, dev)
+
+    # If shapes match, just copy
+    if tuple(old) == tuple(new_shape):
+        src0 = <CudaBuffer>(gt.buffer)
+        with nogil:
+            ret0 = cuda_copy_f32(<float*>src0.ptr, <float*>dst.ptr, total, _default_stream)
+        _check_kernel(ret0)
+        return GpuTensor(dst, tuple(new_shape), gt.dtype, dev)
+
+    # General: broadcast by tiling — use strided copy
+    src = <CudaBuffer>(gt.buffer)
+    # Simple full-broadcast: tile src_n elements N times
+    reps = total // src_n if src_n > 0 else 0
+    if reps * src_n == total and reps > 0:
+        for r in range(reps):
+            with nogil:
+                ret1 = cuda_strided_copy_f32(<float*>src.ptr, <float*>dst.ptr,
+                                             src_n, 0, r * src_n, _default_stream)
+            _check_kernel(ret1)
+        return GpuTensor(dst, tuple(new_shape), gt.dtype, dev)
+    # Fallback: download, expand, upload
+    import numpy as np
+    arr = gputensor_to_numpy(gt)
+    arr = np.broadcast_to(arr.reshape(old), new_shape).copy()
+    return gputensor_from_numpy(arr, dev)
+
+
+# --- Slice / Select (contiguous region copy) ---
+
+def dev_slice(gt, int64_t src_offset, int64_t count, new_shape):
+    """Copy a contiguous region from gt buffer. Returns new GpuTensor."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst = _gt_alloc(count, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_strided_copy_f32(<float*>src.ptr, <float*>dst.ptr,
+                                    count, src_offset, 0, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, tuple(new_shape), gt.dtype, dev)
+
+
+# --- Cat / Stack (multi-tensor concat on device) ---
+
+def dev_cat(tensors, int dim=0):
+    """Concatenate list of GpuTensors along dim. All on same device."""
+    if len(tensors) == 1:
+        return tensors[0]
+
+    # Compute output shape
+    shapes = [t.shape for t in tensors]
+    ndim = len(shapes[0])
+    if dim < 0:
+        dim = ndim + dim
+    out_shape = list(shapes[0])
+    out_shape[dim] = sum(s[dim] for s in shapes)
+
+    cdef int64_t total = 1
+    cdef int64_t inner = 1
+    cdef int64_t outer = 1
+    cdef int64_t dst_offset = 0
+    cdef int64_t t_n = 0
+    cdef int64_t t_dim = 0
+    cdef int64_t slab_src = 0
+    cdef int64_t out_dim_size = 0
+    cdef int64_t slab_out = 0
+    cdef CudaBuffer src
+    cdef CudaBuffer dst
+    cdef int ret = 0
+    cdef int dev
+
+    for s in out_shape:
+        total *= s
+
+    dev = tensors[0].device_id
+    dst = _gt_alloc(total, dev)
+
+    for i in range(dim + 1, ndim):
+        inner *= out_shape[i]
+
+    for i in range(dim):
+        outer *= out_shape[i]
+
+    out_dim_size = out_shape[dim]
+    slab_out = out_dim_size * inner
+
+    for t in tensors:
+        src = <CudaBuffer>(t.buffer)
+        t_n = t.numel
+        if inner == 1 and outer == 1:
+            with nogil:
+                ret = cuda_strided_copy_f32(<float*>src.ptr, <float*>dst.ptr,
+                                            t_n, 0, dst_offset, _default_stream)
+            _check_kernel(ret)
+            dst_offset += t_n
+        else:
+            t_dim = t.shape[dim]
+            slab_src = t_dim * inner
+            for o in range(outer):
+                with nogil:
+                    ret = cuda_strided_copy_f32(<float*>src.ptr, <float*>dst.ptr,
+                                                slab_src,
+                                                o * slab_src,
+                                                o * slab_out + dst_offset,
+                                                _default_stream)
+                _check_kernel(ret)
+            dst_offset += t_dim * inner
+
+    return GpuTensor(dst, tuple(out_shape), tensors[0].dtype, dev)
+
+
+def dev_stack(tensors, int dim=0):
+    """Stack list of GpuTensors along new dim. All shapes must match."""
+    if len(tensors) == 0:
+        raise ValueError("cannot stack empty list")
+    # Unsqueeze all along dim, then cat
+    unsqueezed = [dev_unsqueeze(t, dim) for t in tensors]
+    return dev_cat(unsqueezed, dim)
+
+
+# --- Chunk (split into sub-regions) ---
+
+def dev_chunk(gt, int chunks, int dim=0):
+    """Split GpuTensor into chunks along dim. Returns list of GpuTensors."""
+    shape = gt.shape
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + dim
+    dim_size = shape[dim]
+
+    # Compute chunk sizes
+    cdef int64_t base_size = dim_size // chunks
+    cdef int64_t remainder = dim_size % chunks
+    cdef int64_t inner = 1
+    cdef int64_t outer = 1
+    cdef int64_t dim_offset = 0
+    cdef int64_t chunk_numel = 0
+    cdef int64_t slab_chunk = 0
+    cdef int64_t slab_full = 0
+    cdef int dev = gt.device_id
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef CudaBuffer chunk_dst
+    cdef int ret2 = 0
+
+    sizes = []
+    for i in range(chunks):
+        if i < remainder:
+            sizes.append(base_size + 1)
+        else:
+            sizes.append(base_size)
+
+    results = []
+
+    for i in range(dim + 1, ndim):
+        inner *= shape[i]
+
+    for i in range(dim):
+        outer *= shape[i]
+
+    slab_full = dim_size * inner
+
+    for chunk_size in sizes:
+        if chunk_size == 0:
+            continue
+        new_shape = list(shape)
+        new_shape[dim] = chunk_size
+
+        chunk_numel = 1
+        for s in new_shape:
+            chunk_numel *= s
+
+        chunk_dst = _gt_alloc(chunk_numel, dev)
+
+        if inner == 1 and outer == 1:
+            with nogil:
+                ret2 = cuda_strided_copy_f32(<float*>src.ptr, <float*>chunk_dst.ptr,
+                                             chunk_numel, dim_offset, 0, _default_stream)
+            _check_kernel(ret2)
+        else:
+            slab_chunk = chunk_size * inner
+            for o in range(outer):
+                with nogil:
+                    ret2 = cuda_strided_copy_f32(<float*>src.ptr, <float*>chunk_dst.ptr,
+                                                 slab_chunk,
+                                                 o * slab_full + dim_offset * inner,
+                                                 o * slab_chunk,
+                                                 _default_stream)
+                _check_kernel(ret2)
+
+        results.append(GpuTensor(chunk_dst, tuple(new_shape), gt.dtype, dev))
+        dim_offset += chunk_size
+
+    return results
+
+
+# --- Cumulative sum ---
+
+def dev_cumsum(gt, int dim=-1):
+    """Cumulative sum along dim on device."""
+    shape = gt.shape
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + dim
+    cdef int64_t outer = 1
+    for i in range(dim):
+        outer *= shape[i]
+    cdef int64_t dim_size = shape[dim]
+    cdef int64_t inner = 1
+    for i in range(dim + 1, ndim):
+        inner *= shape[i]
+
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst = _gt_alloc(n, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_cumsum_f32(<float*>src.ptr, <float*>dst.ptr,
+                              outer, dim_size, inner, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, gt.shape, gt.dtype, dev)
+
+
+# --- Mean along dim ---
+
+def dev_mean_dim(gt, int dim=-1, bint keepdim=False):
+    """Mean along dim on device. Returns GpuTensor."""
+    shape = gt.shape
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + dim
+    cdef int64_t outer = 1
+    for i in range(dim):
+        outer *= shape[i]
+    cdef int64_t dim_size = shape[dim]
+    cdef int64_t inner = 1
+    for i in range(dim + 1, ndim):
+        inner *= shape[i]
+
+    cdef int64_t out_numel = outer * inner
+    cdef int dev = gt.device_id
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef CudaBuffer dst = _gt_alloc(out_numel, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_mean_dim_f32(<float*>src.ptr, <float*>dst.ptr,
+                                outer, dim_size, inner, _default_stream)
+    _check_kernel(ret)
+
+    # Compute output shape
+    out_shape = list(shape)
+    if keepdim:
+        out_shape[dim] = 1
+    else:
+        out_shape.pop(dim)
+    if len(out_shape) == 0:
+        out_shape = (1,)  # scalar
+    return GpuTensor(dst, tuple(out_shape), gt.dtype, dev)
+
+
+# --- Sum along dim (returns GpuTensor, not float) ---
+
+def dev_sum_dim(gt, int dim=-1, bint keepdim=False):
+    """Sum along dim on device. Returns GpuTensor."""
+    shape = gt.shape
+    ndim = len(shape)
+    if dim < 0:
+        dim = ndim + dim
+    cdef int64_t outer = 1
+    for i in range(dim):
+        outer *= shape[i]
+    cdef int64_t dim_size = shape[dim]
+    cdef int64_t inner = 1
+    for i in range(dim + 1, ndim):
+        inner *= shape[i]
+
+    cdef int64_t out_numel = outer * inner
+    cdef int dev = gt.device_id
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef CudaBuffer dst = _gt_alloc(out_numel, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_sum_dim_f32(<float*>src.ptr, <float*>dst.ptr,
+                               outer, dim_size, inner, _default_stream)
+    _check_kernel(ret)
+
+    out_shape = list(shape)
+    if keepdim:
+        out_shape[dim] = 1
+    else:
+        out_shape.pop(dim)
+    if len(out_shape) == 0:
+        out_shape = (1,)
+    return GpuTensor(dst, tuple(out_shape), gt.dtype, dev)
+
+
+# --- Sum returning GpuTensor (global) ---
+
+def dev_sum_tensor(gt):
+    """Global sum on device, returns GpuTensor (1,) instead of float."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst = _gt_alloc(1, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_sum_f32(<float*>src.ptr, <float*>dst.ptr, n, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, (1,), gt.dtype, dev)
+
+
+# --- Mean returning GpuTensor (global) ---
+
+def dev_mean_tensor(gt):
+    """Global mean on device, returns GpuTensor (1,)."""
+    cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
+    cdef int dev = gt.device_id
+    # Use sum, then multiply by 1/n
+    cdef CudaBuffer sum_buf = _gt_alloc(1, dev)
+    cdef int ret
+    with nogil:
+        ret = cuda_sum_f32(<float*>src.ptr, <float*>sum_buf.ptr, n, _default_stream)
+    _check_kernel(ret)
+    # Multiply by 1/n
+    cdef CudaBuffer dst = _gt_alloc(1, dev)
+    cdef float inv = 1.0 / <float>n
+    with nogil:
+        ret = cuda_muls_f32(<float*>sum_buf.ptr, inv, <float*>dst.ptr, 1, _default_stream)
+    _check_kernel(ret)
+    return GpuTensor(dst, (1,), gt.dtype, dev)
 
 
 # ================================================================

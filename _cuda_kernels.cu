@@ -1653,6 +1653,202 @@ extern "C" int cuda_transpose_2d_f32(const float* in, float* out,
 
 
 /* ================================================================
+ *  STRIDED COPY — supports non-contiguous slicing and concatenation
+ *
+ *  copy_strided: copy src[i*src_stride] → dst[i*dst_stride] for n elements
+ *  Used for: __getitem__, cat, stack, chunk (contiguous sub-regions)
+ * ================================================================ */
+
+__global__ void strided_copy_f32_kernel(const float* __restrict__ src,
+                                        float* __restrict__ dst,
+                                        int64_t n,
+                                        int64_t src_offset,
+                                        int64_t dst_offset) {
+    GRID_STRIDE_LOOP(i, n) {
+        dst[dst_offset + i] = LDG(&src[src_offset + i]);
+    }
+}
+
+extern "C" int cuda_strided_copy_f32(const float* src, float* dst,
+                                     int64_t n, int64_t src_offset,
+                                     int64_t dst_offset,
+                                     cudaStream_t stream) {
+    if (n == 0) return 0;
+    int block = BLOCK_1D;
+    strided_copy_f32_kernel<<<grid_size(n, block), block, 0, stream>>>(
+        src, dst, n, src_offset, dst_offset);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  POW (element-wise, scalar exponent)
+ * ================================================================ */
+
+__global__ void pow_scalar_f32_kernel(const float* __restrict__ x,
+                                      float* __restrict__ y,
+                                      float exponent, int64_t n) {
+    /* float4 vectorised path */
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* y4 = reinterpret_cast<float4*>(y);
+
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 in = x4[i];
+        float4 out;
+        out.x = powf(in.x, exponent);
+        out.y = powf(in.y, exponent);
+        out.z = powf(in.z, exponent);
+        out.w = powf(in.w, exponent);
+        y4[i] = out;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
+        y[i] = powf(LDG(&x[i]), exponent);
+    }
+}
+
+extern "C" int cuda_pow_scalar_f32(const float* x, float* y,
+                                    float exponent, int64_t n,
+                                    cudaStream_t stream) {
+    if (n == 0) return 0;
+    int block = BLOCK_1D;
+    int64_t work = (n + 3) / 4;
+    pow_scalar_f32_kernel<<<grid_size(work, block), block, 0, stream>>>(
+        x, y, exponent, n);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  CUMULATIVE SUM (along flattened or last dim)
+ *
+ *  Simple sequential per-row scan — good enough for small dims.
+ *  Each thread handles one row: [outer_idx, :dim_size, inner_idx].
+ * ================================================================ */
+
+__global__ void cumsum_lastdim_f32_kernel(const float* __restrict__ x,
+                                          float* __restrict__ y,
+                                          int64_t outer,
+                                          int64_t dim_size,
+                                          int64_t inner) {
+    int64_t total = outer * inner;
+    GRID_STRIDE_LOOP(idx, total) {
+        int64_t o = idx / inner;
+        int64_t i = idx % inner;
+        float acc = 0.0f;
+        for (int64_t d = 0; d < dim_size; d++) {
+            int64_t pos = (o * dim_size + d) * inner + i;
+            acc += LDG(&x[pos]);
+            y[pos] = acc;
+        }
+    }
+}
+
+extern "C" int cuda_cumsum_f32(const float* x, float* y,
+                                int64_t outer, int64_t dim_size,
+                                int64_t inner, cudaStream_t stream) {
+    int64_t total = outer * inner;
+    if (total == 0) return 0;
+    int block = BLOCK_1D;
+    cumsum_lastdim_f32_kernel<<<grid_size(total, block), block, 0, stream>>>(
+        x, y, outer, dim_size, inner);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  MEAN along a dimension
+ *
+ *  Same factoring as sum_dim: [outer, dim_size, inner] → [outer, inner]
+ * ================================================================ */
+
+__global__ void mean_dim_f32_kernel(const float* __restrict__ x,
+                                    float* __restrict__ out,
+                                    int64_t outer, int64_t dim_size,
+                                    int64_t inner) {
+    int64_t total = outer * inner;
+    float inv_dim = __fdividef(1.0f, (float)dim_size);
+    GRID_STRIDE_LOOP(idx, total) {
+        int64_t o = idx / inner;
+        int64_t i = idx % inner;
+        float sum = 0.0f;
+        for (int64_t d = 0; d < dim_size; d++) {
+            sum += LDG(&x[(o * dim_size + d) * inner + i]);
+        }
+        out[idx] = sum * inv_dim;
+    }
+}
+
+extern "C" int cuda_mean_dim_f32(const float* x, float* out,
+                                  int64_t outer, int64_t dim_size,
+                                  int64_t inner, cudaStream_t stream) {
+    int64_t total = outer * inner;
+    if (total == 0) return 0;
+    int block = BLOCK_1D;
+    mean_dim_f32_kernel<<<grid_size(total, block), block, 0, stream>>>(
+        x, out, outer, dim_size, inner);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  ARANGE — fill buffer with [0, 1, 2, ..., n-1]
+ * ================================================================ */
+
+__global__ void arange_f32_kernel(float* __restrict__ out, int64_t n) {
+    GRID_STRIDE_LOOP(i, n) {
+        out[i] = (float)i;
+    }
+}
+
+__global__ void arange_i64_kernel(int64_t* __restrict__ out, int64_t n) {
+    GRID_STRIDE_LOOP(i, n) {
+        out[i] = i;
+    }
+}
+
+extern "C" int cuda_arange_f32(float* out, int64_t n, cudaStream_t stream) {
+    if (n == 0) return 0;
+    arange_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(out, n);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+extern "C" int cuda_arange_i64(int64_t* out, int64_t n, cudaStream_t stream) {
+    if (n == 0) return 0;
+    arange_i64_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(out, n);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  FULL — fill buffer with a constant value (int64)
+ * ================================================================ */
+
+__global__ void fill_i64_kernel(int64_t* __restrict__ out, int64_t value, int64_t n) {
+    GRID_STRIDE_LOOP(i, n) {
+        out[i] = value;
+    }
+}
+
+extern "C" int cuda_fill_i64(int64_t* out, int64_t value, int64_t n, cudaStream_t stream) {
+    if (n == 0) return 0;
+    fill_i64_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(out, value, n);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
  *  HALF PRECISION (FP16) KERNELS — sm_53+
  *
  *  These use __half / half2 intrinsics for 2x throughput on

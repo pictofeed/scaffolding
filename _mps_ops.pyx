@@ -385,6 +385,34 @@ cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vadd_f32(
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vsub_f32(
+        FLOAT32[::1] a, FLOAT32[::1] b):
+    """Element-wise subtract (a - b) via vDSP_vsub (float32).
+    Note: vDSP_vsub(B, IB, A, IA, C, IC, N) computes C = A - B."""
+    cdef unsigned long n = a.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vDSP_vsub(&b[0], 1, &a[0], 1, out, 1, n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vdiv_f32(
+        FLOAT32[::1] a, FLOAT32[::1] b):
+    """Element-wise divide (a / b) via vDSP_vdiv (float32).
+    Note: vDSP_vdiv(B, IB, A, IA, C, IC, N) computes C = A / B."""
+    cdef unsigned long n = a.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vDSP_vdiv(&b[0], 1, &a[0], 1, out, 1, n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
 cpdef np.ndarray[FLOAT32, ndim=1] vdsp_vsmul_f32(
         FLOAT32[::1] a, float scalar):
     """Scalar multiply via vDSP_vsmul (float32)."""
@@ -1167,3 +1195,293 @@ def accelerate_batched_matmul(a, b):
             np.ascontiguousarray(batch_b[bi]))
 
     return result.reshape(a_shape[:a_nd - 1] + (N,))
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Accelerate-backed arithmetic & reduction dispatch
+# ──────────────────────────────────────────────────────────────────────
+
+def accelerate_add(np.ndarray a not None, np.ndarray b not None):
+    """Element-wise add via vDSP_vadd (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32 and b.dtype == np.float32 and shape_a == (<object>b).shape:
+        flat_a = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        flat_b = b.ravel() if b.flags.c_contiguous else np.ascontiguousarray(b).ravel()
+        return (<object>vdsp_vadd_f32(flat_a, flat_b)).reshape(shape_a)
+    return np.add(a, b)
+
+
+def accelerate_sub(np.ndarray a not None, np.ndarray b not None):
+    """Element-wise subtract via vDSP (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32 and b.dtype == np.float32 and shape_a == (<object>b).shape:
+        flat_a = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        flat_b = b.ravel() if b.flags.c_contiguous else np.ascontiguousarray(b).ravel()
+        return (<object>vdsp_vsub_f32(flat_a, flat_b)).reshape(shape_a)
+    return np.subtract(a, b)
+
+
+def accelerate_mul(np.ndarray a not None, np.ndarray b not None):
+    """Element-wise multiply via vDSP_vmul (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32 and b.dtype == np.float32 and shape_a == (<object>b).shape:
+        flat_a = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        flat_b = b.ravel() if b.flags.c_contiguous else np.ascontiguousarray(b).ravel()
+        return (<object>vdsp_vmul_f32(flat_a, flat_b)).reshape(shape_a)
+    return np.multiply(a, b)
+
+
+def accelerate_div(np.ndarray a not None, np.ndarray b not None):
+    """Element-wise divide via vDSP_vdiv (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32 and b.dtype == np.float32 and shape_a == (<object>b).shape:
+        flat_a = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        flat_b = b.ravel() if b.flags.c_contiguous else np.ascontiguousarray(b).ravel()
+        return (<object>vdsp_vdiv_f32(flat_a, flat_b)).reshape(shape_a)
+    return np.divide(a, b)
+
+
+def accelerate_adds(np.ndarray a not None, float scalar):
+    """Scalar add via vDSP_vsadd (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32:
+        flat = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        return (<object>vdsp_vsadd_f32(flat, scalar)).reshape(shape_a)
+    return a + scalar
+
+
+def accelerate_muls(np.ndarray a not None, float scalar):
+    """Scalar multiply via vDSP_vsmul (float32), else NumPy."""
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32:
+        flat = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        return (<object>vdsp_vsmul_f32(flat, scalar)).reshape(shape_a)
+    return a * scalar
+
+
+def accelerate_neg(np.ndarray a not None):
+    """Negate via vDSP_vneg (float32), else NumPy."""
+    cdef unsigned long n
+    cdef np.ndarray flat, result
+    cdef float *out
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32:
+        flat = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        n = flat.shape[0]
+        result = np.empty(n, dtype=np.float32)
+        out = <float *>np.PyArray_DATA(result)
+        with nogil:
+            vDSP_vneg(<float *>np.PyArray_DATA(flat), 1, out, 1, n)
+        return result.reshape(shape_a)
+    return np.negative(a)
+
+
+def accelerate_abs(np.ndarray a not None):
+    """Abs via vDSP — square then sqrt for float32, else NumPy.
+    Uses vDSP_vsq + vvsqrtf which is SIMD-vectorised."""
+    cdef unsigned long n
+    cdef np.ndarray flat, result
+    cdef float *sq_buf
+    cdef float *out
+    cdef int ni
+    cdef tuple shape_a = (<object>a).shape
+    if a.dtype == np.float32:
+        flat = a.ravel() if a.flags.c_contiguous else np.ascontiguousarray(a).ravel()
+        n = flat.shape[0]
+        ni = <int>n
+        result = np.empty(n, dtype=np.float32)
+        sq_buf = <float *>malloc(n * sizeof(float))
+        out = <float *>np.PyArray_DATA(result)
+        if sq_buf == NULL:
+            raise MemoryError("accelerate_abs: allocation failed")
+        with nogil:
+            vDSP_vsq(<float *>np.PyArray_DATA(flat), 1, sq_buf, 1, n)
+            vvsqrtf(out, sq_buf, &ni)
+        free(sq_buf)
+        return result.reshape(shape_a)
+    return np.abs(a)
+
+
+def accelerate_pow_scalar(np.ndarray x not None, float exponent):
+    """Power with scalar exponent — special-cases x^2 via vDSP_vsq."""
+    cdef np.ndarray flat, result
+    cdef unsigned long n
+    cdef float *out
+    cdef float *tmp
+    cdef int ni
+    cdef tuple shape_x = (<object>x).shape
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        n = flat.shape[0]
+        if exponent == 2.0:
+            return (<object>vdsp_vsq_f32(flat)).reshape(shape_x)
+        elif exponent == 0.5:
+            return (<object>veclib_sqrtf(flat)).reshape(shape_x)
+        elif exponent == -0.5:
+            # rsqrt: 1/sqrt(x) = sqrt then reciprocal
+            result = np.empty(n, dtype=np.float32)
+            out = <float *>np.PyArray_DATA(result)
+            tmp = <float *>malloc(n * sizeof(float))
+            ni = <int>n
+            if tmp == NULL:
+                raise MemoryError("accelerate_pow_scalar: allocation failed")
+            with nogil:
+                vvsqrtf(tmp, <float *>np.PyArray_DATA(flat), &ni)
+                vvrecf(out, tmp, &ni)
+            free(tmp)
+            return result.reshape(shape_x)
+    return np.power(x, exponent)
+
+
+def accelerate_clamp(np.ndarray x not None, float lo, float hi):
+    """Clamp via vDSP_vclip (float32), else NumPy."""
+    cdef unsigned long n
+    cdef np.ndarray flat, result
+    cdef float *out
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        n = flat.shape[0]
+        result = np.empty(n, dtype=np.float32)
+        out = <float *>np.PyArray_DATA(result)
+        with nogil:
+            vDSP_vclip(<float *>np.PyArray_DATA(flat), 1, &lo, &hi, out, 1, n)
+        return result.reshape((<object>x).shape)
+    return np.clip(x, lo, hi)
+
+
+def accelerate_sum(np.ndarray x not None, dim=None, bint keepdim=False):
+    """Sum via vDSP_sve (float32), else NumPy.
+    If dim is None, returns scalar sum.
+    If dim is specified, reduces along that axis."""
+    cdef unsigned long n, outer, inner, dim_size, row_stride
+    cdef np.ndarray flat, result_flat
+    cdef float *inp
+    cdef float *outp
+    cdef float val
+    cdef Py_ssize_t i
+    cdef int axis, ndim
+    cdef list perm, res_shape
+    cdef tuple new_shape
+    if dim is None:
+        if x.dtype == np.float32:
+            flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+            return vdsp_sum_f32(flat)
+        return float(np.sum(x))
+    # dim-wise reduction
+    axis = int(dim)
+    ndim = x.ndim
+    if axis < 0:
+        axis = ndim + axis
+    if x.dtype == np.float32:
+        # Move target axis to last, make contiguous, then stride
+        perm = list(range(ndim))
+        perm.pop(axis)
+        perm.append(axis)
+        xt = np.ascontiguousarray(np.transpose(x, perm))
+        new_shape = xt.shape
+        dim_size = <unsigned long>new_shape[ndim - 1]
+        outer = 1
+        for i in range(ndim - 1):
+            outer *= <unsigned long>new_shape[i]
+        flat = xt.reshape(outer, dim_size)
+        result_flat = np.empty(outer, dtype=np.float32)
+        inp = <float *>np.PyArray_DATA(flat)
+        outp = <float *>np.PyArray_DATA(result_flat)
+        with nogil:
+            for i in range(<Py_ssize_t>outer):
+                vDSP_sve(&inp[i * dim_size], 1, &outp[i], dim_size)
+        # Build result shape
+        res_shape = []
+        for i in range(ndim):
+            if i == axis:
+                if keepdim:
+                    res_shape.append(1)
+            else:
+                res_shape.append(x.shape[i])
+        return result_flat.reshape(tuple(res_shape))
+    r = np.sum(x, axis=axis, keepdims=keepdim)
+    return r
+
+
+def accelerate_mean(np.ndarray x not None, dim=None, bint keepdim=False):
+    """Mean via vDSP_meanv (float32), else NumPy.
+    If dim is None, returns scalar mean.
+    If dim is specified, reduces along that axis."""
+    cdef unsigned long n, outer, dim_size
+    cdef np.ndarray flat, result_flat
+    cdef float *inp
+    cdef float *outp
+    cdef Py_ssize_t i
+    cdef int axis, ndim
+    cdef list perm, res_shape
+    cdef tuple new_shape
+    if dim is None:
+        if x.dtype == np.float32:
+            flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+            return vdsp_mean_f32(flat)
+        return float(np.mean(x))
+    # dim-wise reduction
+    axis = int(dim)
+    ndim = x.ndim
+    if axis < 0:
+        axis = ndim + axis
+    if x.dtype == np.float32:
+        perm = list(range(ndim))
+        perm.pop(axis)
+        perm.append(axis)
+        xt = np.ascontiguousarray(np.transpose(x, perm))
+        new_shape = xt.shape
+        dim_size = <unsigned long>new_shape[ndim - 1]
+        outer = 1
+        for i in range(ndim - 1):
+            outer *= <unsigned long>new_shape[i]
+        flat = xt.reshape(outer, dim_size)
+        result_flat = np.empty(outer, dtype=np.float32)
+        inp = <float *>np.PyArray_DATA(flat)
+        outp = <float *>np.PyArray_DATA(result_flat)
+        with nogil:
+            for i in range(<Py_ssize_t>outer):
+                vDSP_meanv(&inp[i * dim_size], 1, &outp[i], dim_size)
+        res_shape = []
+        for i in range(ndim):
+            if i == axis:
+                if keepdim:
+                    res_shape.append(1)
+            else:
+                res_shape.append(x.shape[i])
+        return result_flat.reshape(tuple(res_shape))
+    r = np.mean(x, axis=axis, keepdims=keepdim)
+    return r
+
+
+def accelerate_cumsum(np.ndarray x not None, int dim):
+    """Cumulative sum — uses running vDSP_sve for float32 on last dim."""
+    cdef int ndim = x.ndim
+    cdef int axis = dim if dim >= 0 else ndim + dim
+    cdef tuple shape
+    cdef unsigned long outer, L
+    cdef Py_ssize_t i
+    cdef np.ndarray result
+    cdef float *inp
+    cdef float *outp
+    cdef float running
+    cdef unsigned long j
+    if x.dtype != np.float32 or axis != ndim - 1:
+        return np.cumsum(x, axis=axis)
+    # Fast path for last-dim cumsum
+    shape = (<object>x).shape
+    outer = 1
+    for i in range(ndim - 1):
+        outer *= <unsigned long>shape[i]
+    L = <unsigned long>shape[ndim - 1]
+    flat = np.ascontiguousarray(x).reshape(outer, L)
+    result = np.empty_like(flat)
+    inp = <float *>np.PyArray_DATA(flat)
+    outp = <float *>np.PyArray_DATA(result)
+    with nogil:
+        for i in range(<Py_ssize_t>outer):
+            running = 0.0
+            for j in range(L):
+                running = running + inp[i * L + j]
+                outp[i * L + j] = running
+    return result.reshape(shape)

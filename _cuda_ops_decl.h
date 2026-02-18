@@ -152,6 +152,32 @@ int cuda_transpose_2d_f32(const float* inp, float* out, int rows, int cols,
 /* --- TF32 control --- */
 int cuda_set_tf32(cublasHandle_t handle, int enable);
 
+/* --- Strided copy (slice / cat / stack helper) --- */
+int cuda_strided_copy_f32(const float* src, float* dst,
+                          int64_t n, int64_t src_offset,
+                          int64_t dst_offset, cudaStream_t stream);
+
+/* --- Power (element-wise, scalar exponent) --- */
+int cuda_pow_scalar_f32(const float* x, float* y,
+                        float exponent, int64_t n, cudaStream_t stream);
+
+/* --- Cumulative sum --- */
+int cuda_cumsum_f32(const float* x, float* y,
+                    int64_t outer, int64_t dim_size, int64_t inner,
+                    cudaStream_t stream);
+
+/* --- Mean along dimension --- */
+int cuda_mean_dim_f32(const float* x, float* out,
+                      int64_t outer, int64_t dim_size, int64_t inner,
+                      cudaStream_t stream);
+
+/* --- Arange --- */
+int cuda_arange_f32(float* out, int64_t n, cudaStream_t stream);
+int cuda_arange_i64(int64_t* out, int64_t n, cudaStream_t stream);
+
+/* --- Fill i64 --- */
+int cuda_fill_i64(int64_t* out, int64_t value, int64_t n, cudaStream_t stream);
+
 #ifdef __cplusplus
 }  /* extern "C" */
 #endif
