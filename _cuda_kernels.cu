@@ -106,14 +106,17 @@ struct CosOp   { __device__ __forceinline__ float operator()(float x) const { re
 struct NegOp   { __device__ __forceinline__ float operator()(float x) const { return -x; } };
 struct AbsOp   { __device__ __forceinline__ float operator()(float x) const { return fabsf(x); } };
 
-/* Macro to define the extern "C" launcher for each unary op */
+/* Macro to define the extern "C" launcher for each unary op
+ * Uses float4-vectorised kernel for 4x memory throughput */
 #define DEFINE_UNARY_LAUNCHER(name, OpStruct)                                 \
 extern "C" int cuda_##name##_f32(const float* x, float* y,                    \
                                  int64_t n, cudaStream_t stream) {            \
     if (n == 0) return 0;                                                     \
     int block = BLOCK_1D;                                                     \
-    int grid = grid_size(n, block);                                           \
-    unary_f32_kernel<<<grid, block, 0, stream>>>(x, y, n, OpStruct());        \
+    int64_t n4 = (n + 3) / 4;                                                \
+    int grid = grid_size(n4, block);                                          \
+    elementwise_unary_f32_kernel<<<grid, block, 0, stream>>>(x, y, n,         \
+                                                              OpStruct());    \
     CUDA_CHECK(cudaGetLastError());                                           \
     return 0;                                                                 \
 }
@@ -207,16 +210,17 @@ extern "C" int cuda_muls_f32(const float* a, float scalar, float* c,
 
 /* ================================================================
  *  ACTIVATION KERNELS (Fused forward / backward)
+ *
+ *  Forward paths use float4-vectorised template for throughput.
+ *  Backward paths remain scalar (2-input, 1-output pattern).
  * ================================================================ */
 
-/* ---- ReLU ---- */
-__global__ void relu_f32_kernel(const float* __restrict__ x,
-                                float* __restrict__ y, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
-        float v = LDG(&x[i]);
-        y[i] = v > 0.0f ? v : 0.0f;
-    }
-}
+/* ---- Activation functors (used by vectorised template) ---- */
+struct ReluOp  { __device__ __forceinline__ float operator()(float x) const { return x > 0.0f ? x : 0.0f; } };
+struct SiluOp  { __device__ __forceinline__ float operator()(float x) const { return fast_silu(x); } };
+struct GeluOp  { __device__ __forceinline__ float operator()(float x) const { return fast_gelu(x); } };
+
+/* ---- ReLU forward (vectorised via DEFINE_UNARY_LAUNCHER below) ---- */
 
 __global__ void relu_backward_f32_kernel(const float* __restrict__ grad,
                                          const float* __restrict__ x,
@@ -226,12 +230,8 @@ __global__ void relu_backward_f32_kernel(const float* __restrict__ grad,
     }
 }
 
-extern "C" int cuda_relu_f32(const float* x, float* y, int64_t n, cudaStream_t stream) {
-    if (n == 0) return 0;
-    relu_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(x, y, n);
-    CUDA_CHECK(cudaGetLastError());
-    return 0;
-}
+/* ReLU forward uses vectorised template */
+DEFINE_UNARY_LAUNCHER(relu, ReluOp)
 
 extern "C" int cuda_relu_backward_f32(const float* grad, const float* x,
                                       float* dx, int64_t n, cudaStream_t stream) {
@@ -242,14 +242,7 @@ extern "C" int cuda_relu_backward_f32(const float* grad, const float* x,
 }
 
 /* ---- SiLU (x * sigmoid(x)) ---- */
-__global__ void silu_f32_kernel(const float* __restrict__ x,
-                                float* __restrict__ y, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
-        float v = LDG(&x[i]);
-        float s = 1.0f / (1.0f + expf(-v));
-        y[i] = v * s;
-    }
-}
+/* SiLU simple forward uses vectorised functor */
 
 __global__ void silu_fwd_f32_kernel(const float* __restrict__ x,
                                     float* __restrict__ y,
@@ -275,12 +268,8 @@ __global__ void silu_backward_f32_kernel(const float* __restrict__ grad,
     }
 }
 
-extern "C" int cuda_silu_f32(const float* x, float* y, int64_t n, cudaStream_t stream) {
-    if (n == 0) return 0;
-    silu_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(x, y, n);
-    CUDA_CHECK(cudaGetLastError());
-    return 0;
-}
+/* SiLU forward uses vectorised template */
+DEFINE_UNARY_LAUNCHER(silu, SiluOp)
 
 extern "C" int cuda_silu_fwd_f32(const float* x, float* y, float* sig,
                                  int64_t n, cudaStream_t stream) {
@@ -300,13 +289,7 @@ extern "C" int cuda_silu_backward_f32(const float* grad, const float* x,
     return 0;
 }
 
-/* ---- GELU (tanh approximation) ---- */
-__global__ void gelu_f32_kernel(const float* __restrict__ x,
-                                float* __restrict__ y, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
-        y[i] = fast_gelu(LDG(&x[i]));
-    }
-}
+/* GELU forward uses vectorised functor */
 
 __global__ void gelu_backward_f32_kernel(const float* __restrict__ grad,
                                          const float* __restrict__ x,
@@ -325,12 +308,8 @@ __global__ void gelu_backward_f32_kernel(const float* __restrict__ grad,
     }
 }
 
-extern "C" int cuda_gelu_f32(const float* x, float* y, int64_t n, cudaStream_t stream) {
-    if (n == 0) return 0;
-    gelu_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(x, y, n);
-    CUDA_CHECK(cudaGetLastError());
-    return 0;
-}
+/* GELU forward uses vectorised template */
+DEFINE_UNARY_LAUNCHER(gelu, GeluOp)
 
 extern "C" int cuda_gelu_backward_f32(const float* grad, const float* x,
                                       float* dx, int64_t n, cudaStream_t stream) {
@@ -1023,14 +1002,27 @@ __global__ void dropout_f32_kernel(const float* __restrict__ x,
                                    float* __restrict__ mask,
                                    float p, float scale, int64_t n,
                                    unsigned long long seed) {
-    GRID_STRIDE_LOOP(i, n) {
-        /* philox-based RNG for reproducibility */
-        curandStatePhilox4_32_10_t state;
-        curand_init(seed, i, 0, &state);
-        float r = curand_uniform(&state);
-        float m = (r >= p) ? 1.0f : 0.0f;
-        mask[i] = m * scale;
-        y[i] = LDG(&x[i]) * m * scale;
+    /* One RNG state per thread, generating 4 randoms at a time
+       via native Philox-4x32 output — much faster than per-element init */
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)gridDim.x * blockDim.x;
+
+    curandStatePhilox4_32_10_t state;
+    curand_init(seed, tid, 0, &state);
+
+    /* Each thread handles elements tid*4, tid*4+1, ..., striding by stride*4 */
+    for (int64_t base = tid * 4; base < n; base += stride * 4) {
+        float4 r = curand_uniform4(&state);
+        float rv[4] = {r.x, r.y, r.z, r.w};
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            int64_t i = base + k;
+            if (i < n) {
+                float m = (rv[k] >= p) ? scale : 0.0f;
+                mask[i] = m;
+                y[i] = LDG(&x[i]) * m;
+            }
+        }
     }
 }
 
@@ -1039,8 +1031,34 @@ extern "C" int cuda_dropout_f32(const float* x, float* y, float* mask,
                                 unsigned long long seed, cudaStream_t stream) {
     if (n == 0) return 0;
     float scale = 1.0f / (1.0f - p);
-    dropout_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(
+    /* Each thread handles 4 elements, so divide grid by 4 */
+    int64_t n_threads = (n + 3) / 4;
+    dropout_f32_kernel<<<grid_size(n_threads, BLOCK_1D), BLOCK_1D, 0, stream>>>(
         x, y, mask, p, scale, n, seed);
+    CUDA_CHECK(cudaGetLastError());
+    return 0;
+}
+
+
+/* ================================================================
+ *  ROW-WISE BIAS ADD — C[i,j] += bias[j]  for i in [0, M)
+ * ================================================================ */
+
+__global__ void bias_add_row_f32_kernel(float* __restrict__ C,
+                                        const float* __restrict__ bias,
+                                        int M, int N) {
+    int64_t total = (int64_t)M * N;
+    GRID_STRIDE_LOOP(idx, total) {
+        C[idx] += LDG(&bias[idx % N]);
+    }
+}
+
+extern "C" int cuda_bias_add_row_f32(float* C, const float* bias,
+                                     int M, int N, cudaStream_t stream) {
+    int64_t total = (int64_t)M * N;
+    if (total == 0) return 0;
+    bias_add_row_f32_kernel<<<grid_size(total, BLOCK_1D), BLOCK_1D, 0, stream>>>(
+        C, bias, M, N);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }

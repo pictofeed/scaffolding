@@ -220,6 +220,10 @@ cdef extern from "_cuda_ops_decl.h" nogil:
                             float eps, float wd, float bc1, float bc2,
                             int64_t n, cudaStream_t stream)
 
+    # --- Bias add (row broadcast) ---
+    int cuda_bias_add_row_f32(float* C, const float* bias, int M, int N,
+                              cudaStream_t stream)
+
     # --- Memory utilities ---
     int cuda_fill_f32(float* ptr, float value, int64_t n, cudaStream_t stream)
     int cuda_copy_f32(const float* src, float* dst, int64_t n, cudaStream_t stream)
@@ -865,11 +869,14 @@ def dev_cross_entropy(gt_logits, gt_targets):
             N, C, _default_stream)
     _check_kernel(ret)
 
-    # Download losses to compute mean (small array)
-    cdef np.ndarray losses = np.empty(N, dtype=np.float32)
-    _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(losses), d_losses.ptr,
-                           loss_bytes, cudaMemcpyDeviceToHost))
-    cdef float mean_loss = float(np.mean(losses))
+    # Reduce losses on GPU: sum then divide by N
+    cdef CudaBuffer d_sum = _gt_alloc(1)
+    _check_kernel(cuda_sum_f32(<float*>d_losses.ptr, <float*>d_sum.ptr,
+                               <int64_t>N, _default_stream))
+    cdef float sum_val = 0.0
+    _check_cuda(cudaMemcpy(<void*>&sum_val, d_sum.ptr,
+                           sizeof(float), cudaMemcpyDeviceToHost))
+    cdef float mean_loss = sum_val / <float>N
     probs_gt = GpuTensor(d_probs, (N, C), np.float32)
     return mean_loss, probs_gt
 
@@ -1075,8 +1082,6 @@ def dev_linear_forward(gt_x, gt_weight, gt_bias=None):
     cdef CudaBuffer w_buf = <CudaBuffer>(gt_weight.buffer)
     cdef CudaBuffer c_buf = _gt_alloc(M * N)
     cdef CudaBuffer b_buf
-    cdef np.ndarray c_np
-    cdef np.ndarray b_np
     cdef tuple out_shape
 
     cdef cublasHandle_t handle = _get_cublas()
@@ -1085,18 +1090,11 @@ def dev_linear_forward(gt_x, gt_weight, gt_bias=None):
                               1.0, 0.0, False, True)
     _check_kernel(ret)
 
-    # Add bias if present
+    # Add bias if present — entirely on GPU
     if gt_bias is not None:
         b_buf = <CudaBuffer>(gt_bias.buffer)
-        c_np = np.empty((M, N), dtype=np.float32)
-        _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(c_np), c_buf.ptr,
-                               M * N * sizeof(float), cudaMemcpyDeviceToHost))
-        b_np = np.empty(N, dtype=np.float32)
-        _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(b_np), b_buf.ptr,
-                               N * sizeof(float), cudaMemcpyDeviceToHost))
-        c_np += b_np
-        _check_cuda(cudaMemcpy(c_buf.ptr, <void*>np.PyArray_DATA(c_np),
-                               M * N * sizeof(float), cudaMemcpyHostToDevice))
+        _check_kernel(cuda_bias_add_row_f32(
+            <float*>c_buf.ptr, <float*>b_buf.ptr, M, N, <cudaStream_t>NULL))
 
     out_shape = gt_x.shape[:-1] + (N,)
     return GpuTensor(c_buf, out_shape, np.float32)

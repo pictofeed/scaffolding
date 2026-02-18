@@ -132,6 +132,10 @@ int cuda_dropout_f32(const float* x, float* y, float* mask,
                      float p, int64_t n,
                      unsigned long long seed, cudaStream_t stream);
 
+/* --- Bias add (row broadcast) --- */
+int cuda_bias_add_row_f32(float* C, const float* bias, int M, int N,
+                          cudaStream_t stream);
+
 /* --- Embedding --- */
 int cuda_embedding_f32(const float* weight, const int64_t* indices,
                        float* output, int num_indices, int embed_dim,
