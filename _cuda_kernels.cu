@@ -1171,12 +1171,12 @@ __global__ void relu_f16_kernel(const __half* __restrict__ x,
 
     GRID_STRIDE_LOOP(i, n2) {
         __half2 v = x2[i];
-    #if __CUDA_ARCH__ >= 530
+    #if CUDA_VERSION >= 11000 && __CUDA_ARCH__ >= 530
         y2[i] = __hmax2(v, zero2);
     #else
         float2 f;
-        f.x = fmaxf(__half2float(v.x), 0.0f);
-        f.y = fmaxf(__half2float(v.y), 0.0f);
+        f.x = fmaxf(__half2float(__low2half(v)), 0.0f);
+        f.y = fmaxf(__half2float(__high2half(v)), 0.0f);
         y2[i] = __float22half2_rn(f);
     #endif
     }
