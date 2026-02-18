@@ -100,17 +100,34 @@ setup(
     name='scaffolding',
     version='0.1.0',
     author='Pictofeed, LLC',
-    author_email='engineering@helixtechnologies.dev',
+    author_email='engineering@pictofeed.io',
     description=(
         'A deep learning framework written entirely in Python and Cython — '
         'NumPy + Apple Accelerate'
     ),
     long_description=long_description,
     long_description_content_type='text/markdown',
-    url='https://github.com/helix-technologies/scaffolding',
+    url='https://github.com/pictofeed/scaffolding',
     license='Proprietary',
 
-    packages=find_packages(exclude=['tests', 'tests.*', 'benchmarks']),
+    package_dir={
+        'scaffolding': '.',
+        'scaffolding.nn': 'nn',
+        'scaffolding.optim': 'optim',
+        'scaffolding.backends': 'backends',
+        'scaffolding.cuda': 'cuda',
+        'scaffolding.distributed': 'distributed',
+        'scaffolding.utils': 'utils',
+    },
+    packages=[
+        'scaffolding',
+        'scaffolding.nn',
+        'scaffolding.optim',
+        'scaffolding.backends',
+        'scaffolding.cuda',
+        'scaffolding.distributed',
+        'scaffolding.utils',
+    ],
     ext_modules=extensions,
 
     python_requires='>=3.10',

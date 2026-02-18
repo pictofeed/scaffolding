@@ -54,8 +54,6 @@ test: build
 # ── Clean ──
 clean:
 	rm -rf $(BUILD_DIR) dist *.egg-info
-	rm -f scaffolding/_tensor_ops.c scaffolding/_tensor_ops*.so
-	rm -f scaffolding/_tensor_ops*.html
-	rm -f scaffolding/_mps_ops.c scaffolding/_mps_ops*.so
-	rm -f scaffolding/_mps_ops*.html
+	rm -f _tensor_ops.c _tensor_ops*.so _tensor_ops*.html
+	rm -f _mps_ops.c _mps_ops*.so _mps_ops*.html
 	find . -type d -name __pycache__ -exec rm -rf {} + 2>/dev/null || true

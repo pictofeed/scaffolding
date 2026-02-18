@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 #
 # CMake build system for Scaffolding.
@@ -28,7 +28,7 @@ cmake_minimum_required(VERSION 3.18)
 
 project(Scaffolding
     VERSION 0.1.0
-    DESCRIPTION "PyTorch-compatible deep learning framework"
+    DESCRIPTION "Scaffolding is a lightweight, production-ready deep learning framework built from the ground up using NumPy as its computational backend and Cython-accelerated hot-path operations for maximum throughput. On macOS, Scaffolding leverages Apple's Accelerate framework (BLAS, vDSP, vecLib) through native Cython bindings for near-hardware-level performance on both CPU and Apple Silicon."
     LANGUAGES C CXX
 )
 

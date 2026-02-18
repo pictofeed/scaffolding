@@ -38,8 +38,21 @@ dev = [
     "pytest-benchmark",
 ]
 
-[tool.setuptools.packages.find]
-exclude = ["tests*", "benchmarks*"]
+[tool.setuptools.package-dir]
+scaffolding = "."
+"scaffolding.nn" = "nn"
+"scaffolding.optim" = "optim"
+"scaffolding.backends" = "backends"
+"scaffolding.cuda" = "cuda"
+"scaffolding.distributed" = "distributed"
+"scaffolding.utils" = "utils"
+
+[tool.setuptools.packages]
+find = {}
+
+# Explicit package list (matches setup.py)
+# scaffolding, scaffolding.nn, scaffolding.optim, scaffolding.backends,
+# scaffolding.cuda, scaffolding.distributed, scaffolding.utils
 
 [tool.cython-lint]
 max-line-length = 120

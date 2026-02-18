@@ -73,6 +73,9 @@ from . import cuda
 from . import utils
 
 __all__ = [
+    "__version__",
+    "__author__",
+    
     # Tensor
     'Tensor', 'tensor',
     'zeros', 'zeros_like', 'ones', 'ones_like', 'full',
