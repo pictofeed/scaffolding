@@ -790,8 +790,7 @@ class Tensor:
             if neg_idx >= 0:
                 shape[neg_idx] = self._gpu.numel // known
             shape = tuple(shape)
-            from _cuda_ops import GpuTensor
-            gt = GpuTensor(self._gpu.buffer, shape, self._gpu.dtype)
+            gt = _cuops.GpuTensor(self._gpu.buffer, shape, self._gpu.dtype)
             return Tensor._wrap_gpu(gt, device=self._device)
         result_data = self._data.reshape(shape)
         grad_fn = None
@@ -813,18 +812,7 @@ class Tensor:
             d1 = dim1 if dim1 >= 0 else ndim + dim1
             if ndim == 2 and {d0, d1} == {0, 1}:
                 return Tensor._wrap_gpu(_cuops.dev_transpose_2d(self._gpu), device=self._device)
-            if ndim >= 3 and {d0, d1} == {ndim - 2, ndim - 1}:
-                # Batched 2D transpose: reshape (*, R, C) -> batch of (R, C), transpose each
-                shape = self._gpu.shape
-                R = shape[-2]
-                C = shape[-1]
-                batch = self._gpu.numel // (R * C)
-                from _cuda_ops import GpuTensor as _GpuT
-                flat = _GpuT(self._gpu.buffer, (batch, R, C), self._gpu.dtype)
-                # Use dev_transpose_2d per batch via loop on host
-                # Actually, reshape to (batch*R, C), can't batch-transpose that way.
-                # Fall through to CPU for now
-                pass
+            # For 3D+ transpose of last two dims, fall through to CPU + re-upload
         self._ensure_cpu()
         result_data = np.swapaxes(self._data, dim0, dim1)
         grad_fn = None
