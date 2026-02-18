@@ -322,16 +322,17 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_add(self._gpu, b._gpu),
                                         device=self._device)
-        # MPS/Accelerate fast path (inference only)
+        # MPS/Accelerate fast path (inference only, float ndarray types only)
         if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
             self._ensure_cpu()
-            if isinstance(other, (int, float)):
-                return Tensor._wrap(_mops.accelerate_adds(self._data, float(other)),
+            if isinstance(self._data, np.ndarray) and not np.issubdtype(self._data.dtype, np.integer):
+                if isinstance(other, (int, float)):
+                    return Tensor._wrap(_mops.accelerate_adds(self._data, float(other)),
+                                        False, None, self._device)
+                b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+                b._ensure_cpu()
+                return Tensor._wrap(_mops.accelerate_add(self._data, b._data),
                                     False, None, self._device)
-            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
-            b._ensure_cpu()
-            return Tensor._wrap(_mops.accelerate_add(self._data, b._data),
-                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data + other
@@ -365,16 +366,17 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_sub(self._gpu, b._gpu),
                                         device=self._device)
-        # MPS/Accelerate fast path (inference only)
+        # MPS/Accelerate fast path (inference only, float ndarray types only)
         if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
             self._ensure_cpu()
-            if isinstance(other, (int, float)):
-                return Tensor._wrap(_mops.accelerate_adds(self._data, -float(other)),
+            if isinstance(self._data, np.ndarray) and not np.issubdtype(self._data.dtype, np.integer):
+                if isinstance(other, (int, float)):
+                    return Tensor._wrap(_mops.accelerate_adds(self._data, -float(other)),
+                                        False, None, self._device)
+                b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+                b._ensure_cpu()
+                return Tensor._wrap(_mops.accelerate_sub(self._data, b._data),
                                     False, None, self._device)
-            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
-            b._ensure_cpu()
-            return Tensor._wrap(_mops.accelerate_sub(self._data, b._data),
-                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data - other
@@ -409,16 +411,17 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_mul(self._gpu, b._gpu),
                                         device=self._device)
-        # MPS/Accelerate fast path (inference only)
+        # MPS/Accelerate fast path (inference only, float ndarray types only)
         if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
             self._ensure_cpu()
-            if isinstance(other, (int, float)):
-                return Tensor._wrap(_mops.accelerate_muls(self._data, float(other)),
+            if isinstance(self._data, np.ndarray) and not np.issubdtype(self._data.dtype, np.integer):
+                if isinstance(other, (int, float)):
+                    return Tensor._wrap(_mops.accelerate_muls(self._data, float(other)),
+                                        False, None, self._device)
+                b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+                b._ensure_cpu()
+                return Tensor._wrap(_mops.accelerate_mul(self._data, b._data),
                                     False, None, self._device)
-            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
-            b._ensure_cpu()
-            return Tensor._wrap(_mops.accelerate_mul(self._data, b._data),
-                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data * other
@@ -454,16 +457,17 @@ class Tensor:
             if b._gpu is not None:
                 return Tensor._wrap_gpu(_cuops.dev_div(self._gpu, b._gpu),
                                         device=self._device)
-        # MPS/Accelerate fast path (inference only)
+        # MPS/Accelerate fast path (inference only, float ndarray types only)
         if _USE_MPS and _is_mps(self._device) and not self._requires_grad:
             self._ensure_cpu()
-            if isinstance(other, (int, float)):
-                return Tensor._wrap(_mops.accelerate_muls(self._data, 1.0 / float(other)),
+            if isinstance(self._data, np.ndarray) and not np.issubdtype(self._data.dtype, np.integer):
+                if isinstance(other, (int, float)):
+                    return Tensor._wrap(_mops.accelerate_muls(self._data, 1.0 / float(other)),
+                                        False, None, self._device)
+                b = other if isinstance(other, Tensor) else _ensure_tensor(other)
+                b._ensure_cpu()
+                return Tensor._wrap(_mops.accelerate_div(self._data, b._data),
                                     False, None, self._device)
-            b = other if isinstance(other, Tensor) else _ensure_tensor(other)
-            b._ensure_cpu()
-            return Tensor._wrap(_mops.accelerate_div(self._data, b._data),
-                                False, None, self._device)
         self._ensure_cpu()
         if isinstance(other, (int, float)):
             result_data = self._data / other
