@@ -98,6 +98,10 @@ class AdamW(Optimizer):
                 t = st['step']
                 m, v = st['m'], st['v']
                 grad = p._grad
+                # Ensure grad dtype matches param dtype (autograd may
+                # produce float64 gradients even for float32 params)
+                if grad.dtype != p._data.dtype:
+                    grad = grad.astype(p._data.dtype)
 
                 bc1 = 1.0 - beta1 ** t
                 bc2 = 1.0 - beta2 ** t
@@ -105,10 +109,10 @@ class AdamW(Optimizer):
                 if (_USE_CYTHON_ADAM and p._data.dtype == np.float32
                         and p._data.ndim <= 2):
                     # Use Cython nogil kernel
-                    flat_p = np.ascontiguousarray(p._data).ravel()
-                    flat_g = np.ascontiguousarray(grad).ravel()
-                    flat_m = np.ascontiguousarray(m).ravel()
-                    flat_v = np.ascontiguousarray(v).ravel()
+                    flat_p = np.ascontiguousarray(p._data, dtype=np.float32).ravel()
+                    flat_g = np.ascontiguousarray(grad, dtype=np.float32).ravel()
+                    flat_m = np.ascontiguousarray(m, dtype=np.float32).ravel()
+                    flat_v = np.ascontiguousarray(v, dtype=np.float32).ravel()
                     adamw_step_f32(
                         flat_p, flat_g, flat_m, flat_v,
                         lr, beta1, beta2, eps, wd, bc1, bc2)

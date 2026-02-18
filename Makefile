@@ -32,8 +32,13 @@ build:
 	$(PYTHON) setup.py build_ext --inplace
 
 # ── Editable pip install ──
-install:
-	pip install -e ".[dev]"
+# Uses a .pth file to add the parent directory to sys.path, avoiding
+# the stale site-packages/scaffolding/ directory issue with pip -e.
+install: build
+	@pip install numpy cython pytest pytest-benchmark 2>/dev/null || true
+	@SITE=$$($(PYTHON) -c "import site; print(site.getsitepackages()[0])"); \
+	echo "$(abspath $(dir $(CURDIR)))" > "$$SITE/scaffolding.pth"; \
+	echo "Installed scaffolding.pth → $$SITE/scaffolding.pth"
 
 # ── Wheel ──
 wheel:
