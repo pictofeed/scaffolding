@@ -280,7 +280,7 @@ cdef class CudaBuffer:
 
     def __dealloc__(self):
         if self.owns_memory and self.ptr != NULL:
-            cudaFree(self.ptr)
+            _cache_return(self.ptr, self.nbytes)
             self.ptr = NULL
 
     @property
@@ -315,9 +315,73 @@ def _rebuild_cuda_buffer(np.ndarray arr):
     return buf
 
 
+# ================================================================
+#  CACHING GPU ALLOCATOR
+#
+#  Avoids cudaMalloc/cudaFree per-op (~0.5-1ms each on K80).
+#  Freed buffers go to a size-keyed pool; next alloc of the same
+#  size reuses them instantly.
+# ================================================================
+
+cdef dict _alloc_pool = {}          # nbytes → list[uintptr_t]
+cdef size_t _pool_bytes = 0         # total bytes cached
+cdef size_t _MAX_POOL = <size_t>(2 * 1024 * 1024 * 1024)   # 2 GB cap
+
+cdef void* _cache_pop(size_t nbytes):
+    """Try to pop a cached pointer of exactly *nbytes*. Returns NULL if miss."""
+    global _pool_bytes
+    cdef list bucket
+    cdef uintptr_t addr
+    if nbytes in _alloc_pool:
+        bucket = <list>_alloc_pool[nbytes]
+        if len(bucket) > 0:
+            addr = <uintptr_t>bucket.pop()
+            _pool_bytes -= nbytes
+            return <void*>addr
+    return NULL
+
+cdef void _cache_return(void* ptr, size_t nbytes):
+    """Return a pointer to the cache (or cudaFree if pool is full)."""
+    global _pool_bytes
+    if ptr == NULL:
+        return
+    if _alloc_pool is None:
+        # Interpreter shutting down
+        cudaFree(ptr)
+        return
+    if _pool_bytes + nbytes > _MAX_POOL:
+        cudaFree(ptr)
+        return
+    cdef list bucket
+    if nbytes not in _alloc_pool:
+        _alloc_pool[nbytes] = []
+    bucket = <list>_alloc_pool[nbytes]
+    bucket.append(<uintptr_t>ptr)
+    _pool_bytes += nbytes
+
+def empty_cache():
+    """Free all cached GPU memory (like torch.cuda.empty_cache)."""
+    global _pool_bytes
+    cdef size_t nbytes
+    cdef list bucket
+    cdef uintptr_t addr
+    for nbytes, bucket in _alloc_pool.items():
+        for addr in bucket:
+            cudaFree(<void*>addr)
+    _alloc_pool.clear()
+    _pool_bytes = 0
+
+
 cdef CudaBuffer _make_buffer(size_t nbytes, int device_id):
-    """Allocate a new device buffer."""
+    """Allocate a device buffer, reusing from cache when possible."""
     cdef CudaBuffer buf = CudaBuffer.__new__(CudaBuffer)
+    cdef void* cached = _cache_pop(nbytes)
+    if cached != NULL:
+        buf.ptr = cached
+        buf.nbytes = nbytes
+        buf.device_id = device_id
+        buf.owns_memory = True
+        return buf
     cdef cudaError_t err
     err = cudaMalloc(&buf.ptr, nbytes)
     _check_cuda(err)
@@ -872,6 +936,47 @@ def dev_batched_matmul(gt_a, gt_b):
                                       <float*>a.ptr, <float*>b.ptr, <float*>c.ptr,
                                       1.0, 0.0, batch, strideA, strideB, strideC)
     _check_kernel(ret)
+    cdef tuple out_shape = a_shape[:ndim_a-2] + (M, N_)
+    return GpuTensor(c, out_shape, np.float32)
+
+
+def dev_batched_matmul_nt(gt_a, gt_b):
+    """Batched C = A @ B^T via cuBLAS. a: (...,M,K), b: (...,N,K) → (...,M,N).
+    Loops over batch calling sgemm with transB=True."""
+    cdef tuple a_shape = gt_a.shape
+    cdef tuple b_shape = gt_b.shape
+    cdef int ndim_a = len(a_shape)
+    cdef int ndim_b = len(b_shape)
+    cdef int M = a_shape[ndim_a - 2]
+    cdef int K = a_shape[ndim_a - 1]
+    cdef int N_ = b_shape[ndim_b - 2]  # B is (N, K), output is (M, N)
+
+    cdef int batch = 1
+    cdef int i
+    for i in range(ndim_a - 2):
+        batch *= a_shape[i]
+
+    cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
+    cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
+    cdef CudaBuffer c = _gt_alloc(batch * M * N_)
+
+    cdef cublasHandle_t handle = _get_cublas()
+    cdef int64_t strideA = M * K
+    cdef int64_t strideB = N_ * K
+    cdef int64_t strideC = M * N_
+    cdef int ret
+    cdef float* a_ptr = <float*>a.ptr
+    cdef float* b_ptr = <float*>b.ptr
+    cdef float* c_ptr = <float*>c.ptr
+
+    for i in range(batch):
+        ret = cuda_sgemm(handle, M, N_, K,
+                         a_ptr + i * strideA,
+                         b_ptr + i * strideB,
+                         c_ptr + i * strideC,
+                         1.0, 0.0, False, True)
+        _check_kernel(ret)
+
     cdef tuple out_shape = a_shape[:ndim_a-2] + (M, N_)
     return GpuTensor(c, out_shape, np.float32)
 

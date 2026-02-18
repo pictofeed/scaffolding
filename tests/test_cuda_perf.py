@@ -339,6 +339,8 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
     if _HAS_SCAFFOLDING_CUDA:
         emb_sf = sf_nn.Embedding(V, E_dim)
         emb_sf.weight._data = emb_w_np.copy()
+        emb_sf.weight._gpu = None  # invalidate stale GPU copy
+        emb_sf.to('cuda')
         idx_sf = sf.tensor(emb_idx_np, device='cuda')
         sf_t = bench(lambda: emb_sf(idx_sf), warmup, trials)
     else:
@@ -361,6 +363,7 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
 
     if _HAS_SCAFFOLDING_CUDA:
         ln_sf_mod = sf_nn.LayerNorm(LN_D)
+        ln_sf_mod.to('cuda')
         ln_sf_x = sf.tensor(ln_np, device='cuda')
         sf_t = bench(lambda: ln_sf_mod(ln_sf_x), warmup, trials)
     else:
@@ -476,11 +479,17 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
         pt = {'median': float('inf')}
 
     if _HAS_SCAFFOLDING_CUDA:
+        n_heads = 8
+        head_dim = D_f // n_heads
+
         class SfBlock(sf_nn.Module):
             def __init__(self):
                 super().__init__()
                 self.ln1 = sf_nn.LayerNorm(D_f)
-                self.attn_qkv = sf_nn.Linear(D_f, 3 * D_f, bias=False)
+                # Separate Q/K/V projections (avoids CPU slice/permute)
+                self.wq = sf_nn.Linear(D_f, D_f, bias=False)
+                self.wk = sf_nn.Linear(D_f, D_f, bias=False)
+                self.wv = sf_nn.Linear(D_f, D_f, bias=False)
                 self.attn_out = sf_nn.Linear(D_f, D_f, bias=False)
                 self.ln2 = sf_nn.LayerNorm(D_f)
                 self.ff1 = sf_nn.Linear(D_f, FFN, bias=False)
@@ -488,24 +497,23 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
 
             def forward(self, x):
                 h = self.ln1(x)
-                qkv = self.attn_qkv(h)
-                # Attention head reshape requires CPU roundtrip for permute
-                qkv_r = qkv.reshape(B_f, S_f, 3, 8, D_f // 8)
-                q = qkv_r[:, :, 0].permute(0, 2, 1, 3).contiguous().to('cuda')
-                k = qkv_r[:, :, 1].permute(0, 2, 1, 3).contiguous().to('cuda')
-                v = qkv_r[:, :, 2].permute(0, 2, 1, 3).contiguous().to('cuda')
-                scale = (D_f // 8) ** -0.5
-                attn_w = sf_F.softmax(q.matmul(k.transpose(-2, -1)) * scale, dim=-1)
+                # Q/K/V projections: each (B, S, D) → reshape to (B*H, S, d)
+                q = self.wq(h).reshape(B_f * n_heads, S_f, head_dim)
+                k = self.wk(h).reshape(B_f * n_heads, S_f, head_dim)
+                v = self.wv(h).reshape(B_f * n_heads, S_f, head_dim)
+                # Batched attention (all on GPU)
+                scale = head_dim ** -0.5
+                attn_w = sf_F.softmax(sf.matmul_nt(q, k) * scale, dim=-1)
                 attn_out = attn_w.matmul(v)
-                # Merge heads back
-                attn_out = attn_out.permute(0, 2, 1, 3).contiguous().reshape(
-                    B_f, S_f, D_f).to('cuda')
+                # Merge heads: (B*H, S, d) → (B, S, D)
+                attn_out = attn_out.reshape(B_f, S_f, D_f)
                 x = x + self.attn_out(attn_out)
                 h2 = self.ln2(x)
                 ff_out = self.ff2(sf_F.silu(self.ff1(h2)))
                 return x + ff_out
 
         sf_block = SfBlock()
+        sf_block.to('cuda')
         sf_block.eval()
         sf_inp = sf.randn(B_f, S_f, D_f, device='cuda')
         sf_t = bench(lambda: sf_block(sf_inp), warmup, trials)

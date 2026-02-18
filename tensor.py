@@ -806,6 +806,25 @@ class Tensor:
         return self.reshape(*shape)
 
     def transpose(self, dim0: int, dim1: int) -> 'Tensor':
+        # GPU-resident path for transposing last 2 dims of 3D+ tensor
+        if (_USE_CUDA and _is_cuda(self._device) and self._gpu is not None):
+            ndim = len(self._gpu.shape)
+            d0 = dim0 if dim0 >= 0 else ndim + dim0
+            d1 = dim1 if dim1 >= 0 else ndim + dim1
+            if ndim == 2 and {d0, d1} == {0, 1}:
+                return Tensor._wrap_gpu(_cuops.dev_transpose_2d(self._gpu), device=self._device)
+            if ndim >= 3 and {d0, d1} == {ndim - 2, ndim - 1}:
+                # Batched 2D transpose: reshape (*, R, C) -> batch of (R, C), transpose each
+                shape = self._gpu.shape
+                R = shape[-2]
+                C = shape[-1]
+                batch = self._gpu.numel // (R * C)
+                from _cuda_ops import GpuTensor as _GpuT
+                flat = _GpuT(self._gpu.buffer, (batch, R, C), self._gpu.dtype)
+                # Use dev_transpose_2d per batch via loop on host
+                # Actually, reshape to (batch*R, C), can't batch-transpose that way.
+                # Fall through to CPU for now
+                pass
         self._ensure_cpu()
         result_data = np.swapaxes(self._data, dim0, dim1)
         grad_fn = None
@@ -814,7 +833,11 @@ class Tensor:
             grad_fn = _ag.TransposeBackward()
             grad_fn.inputs = [self]
             grad_fn.saved = {'dim0': dim0, 'dim1': dim1}
-        return Tensor._wrap(result_data, rg, grad_fn, self._device)
+        t = Tensor._wrap(result_data, rg, grad_fn, self._device)
+        # Re-upload to GPU if we're on CUDA
+        if _USE_CUDA and _is_cuda(self._device) and t._data.dtype == np.float32:
+            t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data))
+        return t
 
     def permute(self, *dims) -> 'Tensor':
         if len(dims) == 1 and isinstance(dims[0], (tuple, list)):
@@ -1257,6 +1280,19 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
         grad_fn.inputs = [a, b]
         grad_fn.saved = {'a': a._data, 'b': b._data}
     return Tensor._wrap(result_data, rg, grad_fn, a._device)
+
+
+def matmul_nt(a: Tensor, b: Tensor) -> Tensor:
+    """C = A @ B^T — avoids explicit transpose + GPU-resident batched matmul_nt."""
+    if _USE_CUDA and _is_cuda(a._device):
+        if a._gpu is not None and b._gpu is not None:
+            a_ndim = len(a._gpu.shape)
+            if a_ndim == 2:
+                return Tensor._wrap_gpu(_cuops.dev_matmul_nt(a._gpu, b._gpu), device=a._device)
+            elif a_ndim >= 3:
+                return Tensor._wrap_gpu(_cuops.dev_batched_matmul_nt(a._gpu, b._gpu), device=a._device)
+    # Fallback: explicit transpose
+    return matmul(a, b.transpose(-2, -1))
 
 
 def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:

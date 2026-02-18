@@ -1,6 +1,6 @@
 # ╔══════════════════════════════════════════════════════════════════════╗
-# ║  Scaffolding — Deep Learning Framework                             ║
-# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.    ║
+# ║  Scaffolding — Deep Learning Framework                               ║
+# ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
 """nn.Module — base class for all neural network modules."""
 from __future__ import annotations
@@ -170,8 +170,12 @@ class Module:
     # ---- Device / dtype ----
 
     def to(self, *args, **kwargs) -> 'Module':
-        for p in self._parameters.values():
-            p.to(*args, **kwargs)
+        for name, p in self._parameters.items():
+            new_p = Tensor.to(p, *args, **kwargs)
+            # Update parameter in-place
+            p._data = new_p._data
+            p._gpu = new_p._gpu
+            p._device = new_p._device
         for name, buf in self._buffers.items():
             if buf is not None:
                 self._buffers[name] = buf.to(*args, **kwargs)

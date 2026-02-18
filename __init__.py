@@ -34,7 +34,7 @@ from .tensor import (
     full,
     randn, rand, randint,
     arange, linspace, empty,
-    matmul, cat, stack, outer, where, cumsum,
+    matmul, matmul_nt, cat, stack, outer, where, cumsum,
     exp, log, sqrt, rsqrt, sigmoid, sin, cos,
     atan2, expm1, softmax, sort, multinomial,
     bernoulli,
@@ -80,7 +80,7 @@ __all__ = [
     'Tensor', 'tensor',
     'zeros', 'zeros_like', 'ones', 'ones_like', 'full',
     'randn', 'rand', 'randint', 'arange', 'linspace', 'empty',
-    'matmul', 'cat', 'stack', 'outer', 'where', 'cumsum',
+    'matmul', 'matmul_nt', 'cat', 'stack', 'outer', 'where', 'cumsum',
     'exp', 'log', 'sqrt', 'rsqrt', 'sigmoid', 'sin', 'cos',
     'atan2', 'expm1', 'softmax', 'sort', 'multinomial', 'bernoulli',
     # Dtypes

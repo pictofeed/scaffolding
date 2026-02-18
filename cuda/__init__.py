@@ -190,7 +190,8 @@ def mem_get_info(device: int = 0) -> tuple[int, int]:
 
 def empty_cache() -> None:
     """Release all unused cached memory back to the driver."""
-    pass
+    if _CUDA_AVAILABLE and _cops is not None:
+        _cops.empty_cache()
 
 
 def memory_summary(device: int = 0) -> str:
