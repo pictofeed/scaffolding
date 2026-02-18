@@ -458,7 +458,10 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
                 q = q.permute(0, 3, 1, 2)
                 k = k.permute(0, 3, 1, 2)
                 v = v.permute(0, 3, 1, 2)
-                attn_out = t_F.scaled_dot_product_attention(q, k, v)
+                scale = (D_f // 8) ** -0.5
+                attn_w = torch.matmul(q, k.transpose(-2, -1)) * scale
+                attn_w = torch.softmax(attn_w, dim=-1)
+                attn_out = torch.matmul(attn_w, v)
                 attn_out = attn_out.permute(0, 2, 1, 3).reshape(B_f, S_f, D_f)
                 x = x + self.attn_out(attn_out)
                 h2 = self.ln2(x)
@@ -490,7 +493,9 @@ def run_benchmarks(sz: dict, warmup: int, trials: int) -> list[BenchmarkResult]:
                 q = sf.tensor(qkv_data[:, :, 0].transpose(0, 2, 1, 3), device='cuda')
                 k = sf.tensor(qkv_data[:, :, 1].transpose(0, 2, 1, 3), device='cuda')
                 v = sf.tensor(qkv_data[:, :, 2].transpose(0, 2, 1, 3), device='cuda')
-                attn_out = sf_F.scaled_dot_product_attention(q, k, v)
+                scale = (D_f // 8) ** -0.5
+                attn_w = sf_F.softmax(q.matmul(k.transpose(-2, -1)) * scale, dim=-1)
+                attn_out = attn_w.matmul(v)
                 attn_out_data = attn_out._data.transpose(0, 2, 1, 3).reshape(
                     B_f, S_f, D_f)
                 x_data = x._data + self.attn_out(
