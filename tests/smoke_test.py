@@ -11,7 +11,7 @@ import scaffolding.distributed as dist
 from scaffolding.backends import mps, cudnn, cuda as cuda_be
 
 print("=== Scaffolding Smoke Test ===")
-#print(f"Version:       {torch.__version__}")
+print(f"Version:       {torch.__version__}")
 print(f"MPS available: {mps.is_available()}")
 print(f"MPS built:     {mps.is_built()}")
 print(f"Accelerate:    {mps.has_accelerate()}")
