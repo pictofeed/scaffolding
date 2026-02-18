@@ -15,6 +15,14 @@ from typing import TYPE_CHECKING, Sequence
 if TYPE_CHECKING:
     from .tensor import Tensor
 
+# Try to import Accelerate BLAS for backward passes
+try:
+    from . import _mps_ops as _mops
+    _USE_MPS = True
+except ImportError:
+    _mops = None
+    _USE_MPS = False
+
 
 # ──────────────────────── Global grad mode ────────────────────────────
 
@@ -99,22 +107,31 @@ class GradFn:
 # ──────────────────────── Topological backward ────────────────────────
 
 def _topo_sort(root: 'Tensor') -> list['Tensor']:
-    """Return tensors in reverse topological order for backward."""
+    """Return tensors in reverse topological order for backward.
+    
+    Uses iterative DFS to avoid Python recursion overhead and stack limits.
+    """
     visited: set[int] = set()
     order: list['Tensor'] = []
-
-    def _visit(t: 'Tensor'):
+    # Iterative DFS using explicit stack
+    stack: list[tuple['Tensor', bool]] = [(root, False)]
+    while stack:
+        t, processed = stack[-1]
         tid = id(t)
+        if processed:
+            stack.pop()
+            if tid not in visited:
+                visited.add(tid)
+                order.append(t)
+            continue
         if tid in visited:
-            return
-        visited.add(tid)
+            stack.pop()
+            continue
+        stack[-1] = (t, True)
         if t._grad_fn is not None:
             for inp in t._grad_fn.inputs:
-                if inp is not None:
-                    _visit(inp)
-        order.append(t)
-
-    _visit(root)
+                if inp is not None and id(inp) not in visited:
+                    stack.append((inp, False))
     order.reverse()
     return order
 
@@ -135,48 +152,62 @@ def backward(root: 'Tensor', grad: np.ndarray | None = None) -> None:
         g = getattr(t, '_grad_out', None)
         if g is None:
             continue
-        if t._grad_fn is not None:
-            grads = t._grad_fn.backward(g)
-            for inp, ig in zip(t._grad_fn.inputs, grads):
-                if inp is None or ig is None:
+        gfn = t._grad_fn
+        if gfn is not None:
+            grads = gfn.backward(g)
+            inputs = gfn.inputs
+            for i in range(len(inputs)):
+                inp = inputs[i]
+                if inp is None:
                     continue
-                if not inp.requires_grad:
+                if not inp._requires_grad:
+                    continue
+                ig = grads[i]
+                if ig is None:
                     continue
                 # Reduce broadcast dims
-                ig = _unbroadcast(ig, inp._data.shape)
+                inp_shape = inp._data.shape
+                if ig.shape != inp_shape:
+                    ig = _unbroadcast(ig, inp_shape)
                 if inp._grad is not None:
-                    inp._grad = inp._grad + ig
+                    np.add(inp._grad, ig, out=inp._grad)
                 else:
-                    inp._grad = ig.copy()
+                    inp._grad = ig if ig.flags.owndata else ig.copy()
                 # Propagate for downstream nodes
-                if hasattr(inp, '_grad_out'):
-                    inp._grad_out = inp._grad_out + ig
+                prev = getattr(inp, '_grad_out', None)
+                if prev is not None:
+                    np.add(prev, ig, out=prev)
                 else:
-                    inp._grad_out = ig.copy()
+                    inp._grad_out = ig if ig.flags.owndata else ig.copy()
+            # Free saved tensors early to reduce memory pressure
+            gfn.saved = None
 
     # Cleanup
     for t in order:
-        if hasattr(t, '_grad_out'):
+        try:
             del t._grad_out
+        except AttributeError:
+            pass
 
 
 def _unbroadcast(grad: np.ndarray, shape: tuple) -> np.ndarray:
     """Sum out dimensions that were broadcast."""
+    # Fast path: shapes already match
     if grad.shape == shape:
         return grad
     # Handle scalar case
     if shape == ():
-        return np.sum(grad).reshape(())
+        return grad.sum().reshape(())
     # Pad shape to match grad ndim
     ndim_diff = grad.ndim - len(shape)
-    padded = (1,) * ndim_diff + shape
-    reduce_dims = []
-    for i, (gs, ss) in enumerate(zip(grad.shape, padded)):
-        if ss == 1 and gs != 1:
-            reduce_dims.append(i)
-    if reduce_dims:
-        grad = np.sum(grad, axis=tuple(reduce_dims), keepdims=True)
     if ndim_diff > 0:
+        # Sum over the extra leading dimensions
+        grad = grad.sum(axis=tuple(range(ndim_diff)), keepdims=False)
+    # Now grad.ndim == len(shape); sum where shape has 1
+    reduce_dims = tuple(i for i, s in enumerate(shape) if s == 1 and grad.shape[i] != 1)
+    if reduce_dims:
+        grad = grad.sum(axis=reduce_dims, keepdims=True)
+    if grad.shape != shape:
         grad = grad.reshape(shape)
     return grad
 
@@ -226,8 +257,18 @@ class MatMulBackward(GradFn):
         if a.ndim == 1 and b.ndim == 1:
             return (g * b, g * a)
         if a.ndim >= 2 and b.ndim >= 2:
-            ga = np.matmul(g, _swapaxes(b, -2, -1))
-            gb = np.matmul(_swapaxes(a, -2, -1), g)
+            b_T = _swapaxes(b, -2, -1)
+            a_T = _swapaxes(a, -2, -1)
+            if _USE_MPS and g.dtype == np.float32:
+                ga = _mops.accelerate_batched_matmul(g, b_T) if g.ndim > 2 else (
+                    _mops.blas_sgemm(np.ascontiguousarray(g), np.ascontiguousarray(b_T))
+                    if g.ndim == 2 else np.matmul(g, b_T))
+                gb = _mops.accelerate_batched_matmul(a_T, g) if a_T.ndim > 2 else (
+                    _mops.blas_sgemm(np.ascontiguousarray(a_T), np.ascontiguousarray(g))
+                    if a_T.ndim == 2 else np.matmul(a_T, g))
+            else:
+                ga = np.matmul(g, b_T)
+                gb = np.matmul(a_T, g)
             return (ga, gb)
         if a.ndim == 1:
             ga = np.matmul(g, _swapaxes(b, -2, -1))
@@ -310,7 +351,10 @@ class SiluBackward(GradFn):
 
     def backward(self, g):
         x = self.saved['x']
-        s = 1.0 / (1.0 + np.exp(-x))
+        if _USE_MPS and x.dtype == np.float32:
+            s = _mops.accelerate_sigmoid(x)
+        else:
+            s = 1.0 / (1.0 + np.exp(-x))
         return (g * (s + x * s * (1.0 - s)),)
 
 
@@ -598,32 +642,96 @@ class Conv1dBackward(GradFn):
         B, C_in, L_in = x.shape
         C_out_g, C_in_g, K = weight.shape
 
-        grad_input = np.zeros_like(x)
-        grad_weight = np.zeros_like(weight)
+        # Pad input for im2col
+        if padding > 0:
+            x_padded = np.pad(x, ((0, 0), (0, 0), (padding, padding)), mode='constant')
+        else:
+            x_padded = x
+        L_padded = x_padded.shape[2]
+
         grad_bias = np.sum(g, axis=(0, 2)) if has_bias else None
 
-        c_in_per_group = C_in // groups
-        c_out_per_group = C_out // groups
-
-        # Depthwise / grouped conv backward
-        for b in range(B):
+        if groups == 1:
+            # Vectorized grad_weight via im2col
+            s = x_padded.strides
+            col = np.lib.stride_tricks.as_strided(
+                x_padded,
+                shape=(B, C_in, K, L_out),
+                strides=(s[0], s[1], s[2], s[2]),
+            ).reshape(B, C_in * K, L_out)
+            # grad_weight: einsum('bol,bil->oi')
+            grad_weight = np.einsum('bol,bil->oi', g, col).reshape(weight.shape)
+            
+            # Vectorized grad_input via transposed convolution
+            # Pad g and correlate with flipped weight
+            w_2d = weight.reshape(C_out, -1)  # (C_out, C_in*K)
+            # col_grad: (B, C_in*K, L_out)
+            col_grad = np.einsum('oi,bol->bil', w_2d, g)
+            col_grad = col_grad.reshape(B, C_in, K, L_out)
+            
+            # Scatter col_grad back to grad_input
+            grad_padded = np.zeros_like(x_padded)
+            for k in range(K):
+                grad_padded[:, :, k:k + L_out] += col_grad[:, :, k, :]
+            
+            if padding > 0:
+                grad_input = grad_padded[:, :, padding:-padding]
+            else:
+                grad_input = grad_padded
+        elif groups == C_in and groups == C_out:
+            # Depthwise backward
+            s = x_padded.strides
+            unfolded = np.lib.stride_tricks.as_strided(
+                x_padded,
+                shape=(B, C_in, K, L_out),
+                strides=(s[0], s[1], s[2], s[2]),
+            )
+            # grad_weight: (C_out, 1, K)
+            grad_weight = np.sum(g[:, :, np.newaxis, :] * unfolded, axis=(0, 3)).reshape(weight.shape)
+            
+            # grad_input
+            grad_padded = np.zeros_like(x_padded)
+            w = weight.reshape(C_out, K)
+            for k in range(K):
+                grad_padded[:, :, k:k + L_out] += g * w[np.newaxis, :, k:k+1]
+            
+            if padding > 0:
+                grad_input = grad_padded[:, :, padding:-padding]
+            else:
+                grad_input = grad_padded
+        else:
+            # General grouped backward
+            c_in_per_group = C_in // groups
+            c_out_per_group = C_out // groups
+            grad_input = np.zeros_like(x)
+            grad_weight = np.zeros_like(weight)
+            
             for grp in range(groups):
                 co_start = grp * c_out_per_group
                 ci_start = grp * c_in_per_group
-                for co in range(c_out_per_group):
-                    for ci in range(c_in_per_group):
-                        for k in range(K):
-                            for l in range(L_out):
-                                in_pos = l + k - padding
-                                if 0 <= in_pos < L_in:
-                                    grad_weight[co_start + co, ci, k] += (
-                                        g[b, co_start + co, l]
-                                        * x[b, ci_start + ci, in_pos]
-                                    )
-                                    grad_input[b, ci_start + ci, in_pos] += (
-                                        g[b, co_start + co, l]
-                                        * weight[co_start + co, ci, k]
-                                    )
+                g_grp = g[:, co_start:co_start + c_out_per_group, :]
+                x_grp = x_padded[:, ci_start:ci_start + c_in_per_group, :]
+                w_grp = weight[co_start:co_start + c_out_per_group]
+                
+                s = x_grp.strides
+                col_grp = np.lib.stride_tricks.as_strided(
+                    x_grp,
+                    shape=(B, c_in_per_group, K, L_out),
+                    strides=(s[0], s[1], s[2], s[2]),
+                ).reshape(B, c_in_per_group * K, L_out)
+                
+                w_2d = w_grp.reshape(c_out_per_group, -1)
+                grad_weight[co_start:co_start + c_out_per_group] = np.einsum(
+                    'bol,bil->oi', g_grp, col_grp).reshape(c_out_per_group, c_in_per_group, K)
+                
+                col_grad = np.einsum('oi,bol->bil', w_2d, g_grp).reshape(B, c_in_per_group, K, L_out)
+                grad_padded = np.zeros((B, c_in_per_group, L_padded), dtype=x.dtype)
+                for k in range(K):
+                    grad_padded[:, :, k:k + L_out] += col_grad[:, :, k, :]
+                if padding > 0:
+                    grad_input[:, ci_start:ci_start + c_in_per_group, :] = grad_padded[:, :, padding:-padding]
+                else:
+                    grad_input[:, ci_start:ci_start + c_in_per_group, :] = grad_padded
 
         results = [grad_input, grad_weight]
         if has_bias:
@@ -640,11 +748,22 @@ class LinearBackward(GradFn):
         weight = self.saved['weight']
         has_bias = self.saved['has_bias']
         # g: (..., out_features), weight: (out_features, in_features)
-        grad_input = np.matmul(g, weight)
-        # Flatten batch dims for grad_weight
+        # Flatten batch dims for BLAS
         g_2d = g.reshape(-1, g.shape[-1])
         x_2d = x.reshape(-1, x.shape[-1])
-        grad_weight = np.matmul(g_2d.T, x_2d)
+        if _USE_MPS and g.dtype == np.float32 and weight.dtype == np.float32:
+            # grad_input = g_2d @ weight  (no transpose needed)
+            grad_input_2d = _mops.blas_sgemm(
+                np.ascontiguousarray(g_2d),
+                np.ascontiguousarray(weight))
+            grad_input = grad_input_2d.reshape(g.shape[:-1] + (weight.shape[1],))
+            # grad_weight = g_2d.T @ x_2d
+            grad_weight = _mops.blas_sgemm_tn(
+                np.ascontiguousarray(g_2d),
+                np.ascontiguousarray(x_2d))
+        else:
+            grad_input = np.matmul(g, weight)
+            grad_weight = np.matmul(g_2d.T, x_2d)
         results = [grad_input, grad_weight]
         if has_bias:
             grad_bias = np.sum(g_2d, axis=0)
@@ -664,16 +783,28 @@ class ScaledDotProductAttentionBackward(GradFn):
             self.saved['v'], self.saved['attn_weights'])
         scale = self.saved['scale']
 
-        # dV = attn^T @ dO
-        dv = np.matmul(np.swapaxes(attn_weights, -2, -1), g)
-        # d_attn = dO @ V^T
-        d_attn = np.matmul(g, np.swapaxes(v, -2, -1))
+        if _USE_MPS and g.dtype == np.float32 and g.ndim >= 2:
+            # dV = attn^T @ dO
+            dv = _mops.accelerate_batched_matmul(
+                np.swapaxes(attn_weights, -2, -1), g)
+            # d_attn = dO @ V^T
+            d_attn = _mops.accelerate_batched_matmul(
+                g, np.swapaxes(v, -2, -1))
+        else:
+            dv = np.matmul(np.swapaxes(attn_weights, -2, -1), g)
+            d_attn = np.matmul(g, np.swapaxes(v, -2, -1))
+
         # d_scores = attn * (d_attn - sum(d_attn * attn, dim=-1, keepdim=True))
         d_scores = attn_weights * (d_attn - np.sum(d_attn * attn_weights, axis=-1, keepdims=True))
         d_scores *= scale
-        # dQ = d_scores @ K, dK = d_scores^T @ Q
-        dq = np.matmul(d_scores, k)
-        dk = np.matmul(np.swapaxes(d_scores, -2, -1), q)
+
+        if _USE_MPS and g.dtype == np.float32 and g.ndim >= 2:
+            dq = _mops.accelerate_batched_matmul(d_scores, k)
+            dk = _mops.accelerate_batched_matmul(
+                np.swapaxes(d_scores, -2, -1), q)
+        else:
+            dq = np.matmul(d_scores, k)
+            dk = np.matmul(np.swapaxes(d_scores, -2, -1), q)
 
         return (dq, dk, dv)
 

@@ -17,23 +17,28 @@ def clip_grad_norm_(parameters, max_norm: float,
 
     Returns the total norm before clipping.
     """
-    params = list(parameters)
+    params = [p for p in parameters if p._grad is not None]
+    if not params:
+        return 0.0
+
     if norm_type == float('inf'):
-        total_norm = max(
-            np.max(np.abs(p._grad)) if p._grad is not None else 0.0
-            for p in params
-        )
+        total_norm = max(np.max(np.abs(p._grad)) for p in params)
+    elif norm_type == 2.0:
+        # Optimized L2 norm: use dot product instead of abs**2
+        total_norm_sq = 0.0
+        for p in params:
+            g = p._grad.ravel()
+            total_norm_sq += np.dot(g, g)
+        total_norm = math.sqrt(total_norm_sq)
     else:
         total_norm = 0.0
         for p in params:
-            if p._grad is not None:
-                total_norm += np.sum(np.abs(p._grad) ** norm_type)
+            total_norm += np.sum(np.abs(p._grad) ** norm_type)
         total_norm = float(total_norm ** (1.0 / norm_type))
 
     clip_coef = max_norm / (total_norm + 1e-6)
     if clip_coef < 1.0:
         for p in params:
-            if p._grad is not None:
-                p._grad *= clip_coef
+            p._grad *= clip_coef
 
     return total_norm

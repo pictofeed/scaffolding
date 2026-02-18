@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from ..tensor import Tensor
+from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _mops, _cops
 from .. import autograd as _ag
 from .module import Module
 from .parameter import Parameter
@@ -34,13 +34,17 @@ class Linear(Module):
             self.bias = None  # type: ignore[assignment]
 
     def forward(self, x: Tensor) -> Tensor:
-        result_data = np.matmul(x._data, self.weight._data.T)
+        # Use BLAS sgemm_nt to avoid transposing weight
+        w_data = self.weight._data
+        if _USE_MPS and x._data.dtype == np.float32 and w_data.dtype == np.float32:
+            result_data = _mops.accelerate_linear_forward(x._data, w_data)
+        else:
+            result_data = x._data @ w_data.T
         has_bias = self.bias is not None and isinstance(self.bias, Parameter)
         if has_bias:
             result_data = result_data + self.bias._data
 
-        rg = x._requires_grad or self.weight._requires_grad
-        rg = rg and _ag.is_grad_enabled()
+        rg = (x._requires_grad or self.weight._requires_grad) and _ag.is_grad_enabled()
         grad_fn = None
         if rg:
             grad_fn = _ag.LinearBackward()
@@ -50,7 +54,7 @@ class Linear(Module):
             grad_fn.inputs = inputs
             grad_fn.saved = {
                 'input': x._data,
-                'weight': self.weight._data,
+                'weight': w_data,
                 'has_bias': has_bias,
             }
         return Tensor._wrap(result_data, rg, grad_fn, x._device)
@@ -74,7 +78,9 @@ class Embedding(Module):
         self.weight = Parameter(Tensor(w))
 
     def forward(self, indices: Tensor) -> Tensor:
-        idx = indices._data.astype(np.intp)
+        idx = indices._data
+        if idx.dtype != np.intp:
+            idx = idx.astype(np.intp)
         result_data = self.weight._data[idx]
 
         rg = self.weight._requires_grad and _ag.is_grad_enabled()
@@ -121,7 +127,10 @@ class Conv1d(Module):
             self.bias = None  # type: ignore[assignment]
 
     def forward(self, x: Tensor) -> Tensor:
-        """x: (B, C_in, L) → (B, C_out, L_out)"""
+        """x: (B, C_in, L) → (B, C_out, L_out)
+        
+        Uses vectorized im2col approach instead of Python loops.
+        """
         B, C_in, L = x._data.shape
         K = self.kernel_size
         P = self.padding
@@ -133,20 +142,50 @@ class Conv1d(Module):
         else:
             x_padded = x._data
 
-        out = np.zeros((B, self.out_channels, L_out), dtype=np.float32)
-        c_in_per_group = C_in // self.groups
-        c_out_per_group = self.out_channels // self.groups
-
-        for grp in range(self.groups):
-            co_start = grp * c_out_per_group
-            ci_start = grp * c_in_per_group
-            for co in range(c_out_per_group):
-                for ci in range(c_in_per_group):
-                    for k in range(K):
-                        out[:, co_start + co, :] += (
-                            self.weight._data[co_start + co, ci, k]
-                            * x_padded[:, ci_start + ci, k:k + L_out]
-                        )
+        if self.groups == 1:
+            # Standard convolution: fully vectorized with im2col
+            # Build im2col matrix: (B, C_in*K, L_out) via stride tricks
+            # Equivalent to unfolding the input
+            strides = x_padded.strides
+            col = np.lib.stride_tricks.as_strided(
+                x_padded,
+                shape=(B, C_in, K, L_out),
+                strides=(strides[0], strides[1], strides[2], strides[2]),
+            ).reshape(B, C_in * K, L_out)
+            # weight: (C_out, C_in, K) → (C_out, C_in*K)
+            w_2d = self.weight._data.reshape(self.out_channels, -1)
+            # out: (B, C_out, L_out)  via batched matmul
+            out = np.einsum('oi,bil->bol', w_2d, col)
+        elif self.groups == C_in and self.groups == self.out_channels:
+            # Depthwise convolution: vectorized per-channel
+            strides = x_padded.strides
+            # unfolded: (B, C_in, K, L_out)
+            unfolded = np.lib.stride_tricks.as_strided(
+                x_padded,
+                shape=(B, C_in, K, L_out),
+                strides=(strides[0], strides[1], strides[2], strides[2]),
+            )
+            # weight: (C_out, 1, K) → (1, C_out, K, 1)
+            w = self.weight._data.reshape(1, self.out_channels, K, 1)
+            out = np.sum(unfolded * w, axis=2)
+        else:
+            # General grouped convolution: vectorized per group
+            c_in_per_group = C_in // self.groups
+            c_out_per_group = self.out_channels // self.groups
+            strides = x_padded.strides
+            out = np.zeros((B, self.out_channels, L_out), dtype=np.float32)
+            for grp in range(self.groups):
+                ci_start = grp * c_in_per_group
+                co_start = grp * c_out_per_group
+                x_grp = x_padded[:, ci_start:ci_start + c_in_per_group, :]
+                s = x_grp.strides
+                col_grp = np.lib.stride_tricks.as_strided(
+                    x_grp,
+                    shape=(B, c_in_per_group, K, L_out),
+                    strides=(s[0], s[1], s[2], s[2]),
+                ).reshape(B, c_in_per_group * K, L_out)
+                w_grp = self.weight._data[co_start:co_start + c_out_per_group].reshape(c_out_per_group, -1)
+                out[:, co_start:co_start + c_out_per_group, :] = np.einsum('oi,bil->bol', w_grp, col_grp)
 
         has_bias = self.bias is not None and isinstance(self.bias, Parameter)
         if has_bias:
@@ -210,8 +249,18 @@ class SiLU(Module):
     """SiLU (Swish) activation: x * sigmoid(x)."""
 
     def forward(self, x: Tensor) -> Tensor:
-        sig = 1.0 / (1.0 + np.exp(-x._data))
-        result_data = x._data * sig
+        if _USE_MPS:
+            result_data = _mops.accelerate_silu(x._data)
+        elif _USE_CYTHON:
+            flat = np.ascontiguousarray(x._data).ravel()
+            if flat.dtype == np.float32:
+                result_data = _cops.silu_1d_f32(flat).reshape(x._data.shape)
+            else:
+                sig = 1.0 / (1.0 + np.exp(-x._data))
+                result_data = x._data * sig
+        else:
+            sig = 1.0 / (1.0 + np.exp(-x._data))
+            result_data = x._data * sig
         rg = x._requires_grad and _ag.is_grad_enabled()
         grad_fn = None
         if rg:
@@ -242,8 +291,11 @@ class GELU(Module):
     """Gaussian Error Linear Unit."""
 
     def forward(self, x: Tensor) -> Tensor:
-        result_data = 0.5 * x._data * (1 + np.tanh(
-            math.sqrt(2.0 / math.pi) * (x._data + 0.044715 * x._data ** 3)))
+        if _USE_MPS:
+            result_data = _mops.accelerate_gelu(x._data)
+        else:
+            result_data = 0.5 * x._data * (1 + np.tanh(
+                math.sqrt(2.0 / math.pi) * (x._data + 0.044715 * x._data ** 3)))
         return Tensor._wrap(result_data, x._requires_grad, None, x._device)
 
 

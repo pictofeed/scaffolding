@@ -1,3 +1,7 @@
+# <div align="center">
+    <img src="img/scaffolding-logo.png" alt="Scaffolding Logo" width="180"/>
+</div>
+
 # Scaffolding
 
 **A deep learning framework written entirely in Python and Cython.**

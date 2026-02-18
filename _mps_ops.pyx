@@ -243,6 +243,64 @@ cpdef np.ndarray[FLOAT64, ndim=2] blas_dgemm(
     return result
 
 
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm_nt(
+        FLOAT32[:, ::1] a, FLOAT32[:, ::1] b):
+    """C = A @ B^T using cblas_sgemm with B transposed (float32).
+
+    A: (M, K)  B: (N, K)  →  C: (M, N)
+    Avoids allocating a transposed copy of B.
+    """
+    cdef int M = a.shape[0]
+    cdef int K = a.shape[1]
+    cdef int N = b.shape[0]
+    cdef float alpha = 1.0
+    cdef float beta  = 0.0
+    cdef float *out = <float *>malloc(M * N * sizeof(float))
+    if out == NULL:
+        raise MemoryError("blas_sgemm_nt: allocation failed")
+    with nogil:
+        cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasTrans,
+                    M, N, K, alpha,
+                    &a[0, 0], K,
+                    &b[0, 0], K,
+                    beta, out, N)
+    result = np.empty((M, N), dtype=np.float32)
+    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(float))
+    free(out)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=2] blas_sgemm_tn(
+        FLOAT32[:, ::1] a, FLOAT32[:, ::1] b):
+    """C = A^T @ B using cblas_sgemm with A transposed (float32).
+
+    A: (K, M)  B: (K, N)  →  C: (M, N)
+    Avoids allocating a transposed copy of A.
+    """
+    cdef int K = a.shape[0]
+    cdef int M = a.shape[1]
+    cdef int N = b.shape[1]
+    cdef float alpha = 1.0
+    cdef float beta  = 0.0
+    cdef float *out = <float *>malloc(M * N * sizeof(float))
+    if out == NULL:
+        raise MemoryError("blas_sgemm_tn: allocation failed")
+    with nogil:
+        cblas_sgemm(CblasRowMajor, CblasTrans, CblasNoTrans,
+                    M, N, K, alpha,
+                    &a[0, 0], M,
+                    &b[0, 0], N,
+                    beta, out, N)
+    result = np.empty((M, N), dtype=np.float32)
+    memcpy(np.PyArray_DATA(result), out, M * N * sizeof(float))
+    free(out)
+    return result
+
+
 # ──────────────────────────────────────────────────────────────────────
 #  Element-wise transcendentals via vecLib
 # ──────────────────────────────────────────────────────────────────────
@@ -813,6 +871,54 @@ def accelerate_gelu(np.ndarray x not None):
         np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
+def accelerate_log(np.ndarray x not None):
+    """Log dispatch via vecLib."""
+    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef tuple shape = (<object>x).shape
+    if flat.dtype == np.float32:
+        return veclib_logf(flat).reshape(shape)
+    return np.log(x)
+
+
+def accelerate_sqrt(np.ndarray x not None):
+    """Sqrt dispatch via vecLib."""
+    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef tuple shape = (<object>x).shape
+    if flat.dtype == np.float32:
+        return veclib_sqrtf(flat).reshape(shape)
+    return np.sqrt(x)
+
+
+def accelerate_tanh(np.ndarray x not None):
+    """Tanh dispatch via vecLib."""
+    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef tuple shape = (<object>x).shape
+    if flat.dtype == np.float32:
+        return veclib_tanhf(flat).reshape(shape)
+    return np.tanh(x)
+
+
+def accelerate_rsqrt(np.ndarray x not None):
+    """Rsqrt dispatch: 1/sqrt(x) via accelerate_sqrt."""
+    return 1.0 / accelerate_sqrt(x)
+
+
+def accelerate_linear_forward(np.ndarray x not None, np.ndarray w not None):
+    """Optimized x @ w.T for Linear layers using BLAS sgemm_nt.
+    
+    x: (..., in_features), w: (out_features, in_features)
+    Returns: (..., out_features)
+    """
+    cdef tuple orig_shape = (<object>x).shape
+    cdef int in_f = w.shape[1]
+    cdef int out_f = w.shape[0]
+    if x.dtype == np.float32 and w.dtype == np.float32:
+        x_2d = np.ascontiguousarray(x.reshape(-1, in_f))
+        w_c = np.ascontiguousarray(w)
+        return (<object>blas_sgemm_nt(x_2d, w_c)).reshape(orig_shape[:-1] + (out_f,))
+    return np.matmul(x, w.T)
+
+
 def accelerate_adamw_step(np.ndarray param not None,
                            np.ndarray grad not None,
                            np.ndarray m not None,
@@ -820,14 +926,20 @@ def accelerate_adamw_step(np.ndarray param not None,
                            float lr, float beta1, float beta2,
                            float eps, float weight_decay,
                            float bc1, float bc2):
-    """AdamW step dispatch — in-place on param/m/v arrays."""
+    """AdamW step dispatch — in-place on param/m/v arrays (any shape)."""
+    cdef tuple shape = (<object>param).shape
     if param.dtype == np.float32:
+        flat_p = np.ascontiguousarray(param).ravel()
+        flat_g = np.ascontiguousarray(grad).ravel()
+        flat_m = np.ascontiguousarray(m).ravel()
+        flat_v = np.ascontiguousarray(v).ravel()
         accelerate_adamw_step_f32(
-            np.ascontiguousarray(param).ravel(),
-            np.ascontiguousarray(grad).ravel(),
-            np.ascontiguousarray(m).ravel(),
-            np.ascontiguousarray(v).ravel(),
+            flat_p, flat_g, flat_m, flat_v,
             lr, beta1, beta2, eps, weight_decay, bc1, bc2)
+        # Copy back in-place
+        np.copyto(param.ravel(), flat_p)
+        np.copyto(m.ravel(), flat_m)
+        np.copyto(v.ravel(), flat_v)
     else:
         # Pure-NumPy fallback for non-float32
         param *= (1.0 - lr * weight_decay)
@@ -836,3 +948,42 @@ def accelerate_adamw_step(np.ndarray param not None,
         m_hat = m / bc1
         v_hat = v / bc2
         param -= lr * m_hat / (np.sqrt(v_hat) + eps)
+
+
+def accelerate_batched_matmul(np.ndarray a not None, np.ndarray b not None):
+    """Batched matmul using Accelerate BLAS for each 2D slice.
+    
+    Handles arbitrary batch dimensions. Falls back to np.matmul for
+    non-float32 or 1D cases.
+    """
+    if a.dtype != np.float32 or b.dtype != np.float32:
+        return np.matmul(a, b)
+    if a.ndim == 2 and b.ndim == 2:
+        return <object>blas_sgemm(np.ascontiguousarray(a), np.ascontiguousarray(b))
+    if a.ndim < 2 or b.ndim < 2:
+        return np.matmul(a, b)
+    
+    # Broadcast batch dimensions
+    cdef tuple a_shape = (<object>a).shape
+    cdef tuple b_shape = (<object>b).shape
+    cdef int M = a_shape[-2]
+    cdef int K = a_shape[-1]
+    cdef int N = b_shape[-1]
+    
+    # Reshape to 3D: (batch, M, K) and (batch, K, N)
+    batch_a = a.reshape(-1, M, K)
+    if b.ndim == a.ndim:
+        batch_b = b.reshape(-1, K, N)
+    else:
+        batch_b = np.broadcast_to(b, a_shape[:-2] + b_shape[-2:]).reshape(-1, K, N)
+    
+    cdef int batch_size = batch_a.shape[0]
+    result = np.empty((batch_size, M, N), dtype=np.float32)
+    
+    cdef int i
+    for i in range(batch_size):
+        result[i] = <object>blas_sgemm(
+            np.ascontiguousarray(batch_a[i]),
+            np.ascontiguousarray(batch_b[i if i < batch_b.shape[0] else 0]))
+    
+    return result.reshape(a_shape[:-1] + (N,))

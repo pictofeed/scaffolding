@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from ..tensor import Tensor, _USE_MPS, _is_mps, _mops
+from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _mops, _cops
 from .. import autograd as _ag
 
 
@@ -26,8 +26,15 @@ def relu(input: Tensor, inplace: bool = False) -> Tensor:
 
 
 def silu(input: Tensor) -> Tensor:
-    if _USE_MPS and _is_mps(input._device):
+    if _USE_MPS:
         result_data = _mops.accelerate_silu(input._data)
+    elif _USE_CYTHON:
+        flat = np.ascontiguousarray(input._data).ravel()
+        if flat.dtype == np.float32:
+            result_data = _cops.silu_1d_f32(flat).reshape(input._data.shape)
+        else:
+            sig = 1.0 / (1.0 + np.exp(-input._data))
+            result_data = input._data * sig
     else:
         sig = 1.0 / (1.0 + np.exp(-input._data))
         result_data = input._data * sig
@@ -41,7 +48,7 @@ def silu(input: Tensor) -> Tensor:
 
 
 def gelu(input: Tensor) -> Tensor:
-    if _USE_MPS and _is_mps(input._device):
+    if _USE_MPS:
         result_data = _mops.accelerate_gelu(input._data)
     else:
         x = input._data
@@ -72,12 +79,26 @@ def softplus(input: Tensor, beta: float = 1.0,
 
 def softmax(input: Tensor, dim: int = -1, dtype=None) -> Tensor:
     x = input._data
-    if _USE_MPS and _is_mps(input._device) and x.ndim == 2 and dim in (-1, x.ndim - 1):
-        s = _mops.accelerate_softmax(x, dim)
+    if _USE_MPS and x.dtype == np.float32:
+        # Reshape to 2D for Accelerate path
+        if x.ndim == 2 and dim in (-1, x.ndim - 1):
+            s = _mops.accelerate_softmax(np.ascontiguousarray(x), -1)
+        elif dim in (-1, x.ndim - 1) and x.ndim >= 2:
+            orig_shape = x.shape
+            x_2d = x.reshape(-1, x.shape[-1])
+            s = _mops.accelerate_softmax(np.ascontiguousarray(x_2d), -1).reshape(orig_shape)
+        else:
+            x_max = x.max(axis=dim, keepdims=True)
+            e = np.exp(x - x_max)
+            e_sum = e.sum(axis=dim, keepdims=True)
+            np.divide(e, e_sum, out=e)
+            s = e
     else:
-        x_max = np.max(x, axis=dim, keepdims=True)
+        x_max = x.max(axis=dim, keepdims=True)
         e = np.exp(x - x_max)
-        s = e / np.sum(e, axis=dim, keepdims=True)
+        e_sum = e.sum(axis=dim, keepdims=True)
+        np.divide(e, e_sum, out=e)
+        s = e
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
@@ -108,20 +129,22 @@ def cross_entropy(input: Tensor, target: Tensor,
         x = x.reshape(1, -1)
         t = t.reshape(-1)
 
-    N, C = x.shape
-    # Stable softmax
-    x_max = np.max(x, axis=-1, keepdims=True)
+    N = x.shape[0]
+    # Stable softmax - fused with fewer temporaries
+    x_max = x.max(axis=-1, keepdims=True)
     e = np.exp(x - x_max)
-    probs = e / np.sum(e, axis=-1, keepdims=True)
+    e_sum = e.sum(axis=-1, keepdims=True)
+    np.divide(e, e_sum, out=e)
+    probs = e
 
-    # NLL
-    log_probs = np.log(probs + 1e-12)
-    losses = -log_probs[np.arange(N), t]
+    # NLL - avoid full log computation, only need selected entries
+    selected_probs = probs[np.arange(N), t]
+    losses = -np.log(selected_probs + 1e-12)
 
     if reduction == 'mean':
-        result_data = np.array(losses.mean(), dtype=np.float32)
+        result_data = np.float32(losses.mean())
     elif reduction == 'sum':
-        result_data = np.array(losses.sum(), dtype=np.float32)
+        result_data = np.float32(losses.sum())
     else:
         result_data = losses
 
@@ -194,19 +217,38 @@ def scaled_dot_product_attention(
     d = q._data.shape[-1]
     if scale is None:
         scale = 1.0 / math.sqrt(d)
-    scores = np.matmul(q._data, np.swapaxes(k._data, -2, -1)) * scale
+    # Fused scores computation
+    k_T = np.swapaxes(k._data, -2, -1)
+    if _USE_MPS and q._data.dtype == np.float32 and q._data.ndim >= 2:
+        scores = _mops.accelerate_batched_matmul(q._data, k_T)
+    else:
+        scores = np.matmul(q._data, k_T)
+    scores *= scale
     if attn_mask is not None:
         mask_data = attn_mask._data if isinstance(attn_mask, Tensor) else attn_mask
-        scores = scores + mask_data
-    # Softmax
-    s_max = np.max(scores, axis=-1, keepdims=True)
-    e = np.exp(scores - s_max)
-    attn_weights = e / np.sum(e, axis=-1, keepdims=True)
+        scores += mask_data
+    # In-place softmax
+    if _USE_MPS and scores.dtype == np.float32 and scores.ndim >= 2:
+        orig_shape = scores.shape
+        scores_2d = scores.reshape(-1, scores.shape[-1])
+        attn_weights = _mops.accelerate_softmax(
+            np.ascontiguousarray(scores_2d), -1).reshape(orig_shape)
+    else:
+        s_max = scores.max(axis=-1, keepdims=True)
+        scores -= s_max
+        np.exp(scores, out=scores)
+        s_sum = scores.sum(axis=-1, keepdims=True)
+        np.divide(scores, s_sum, out=scores)
+        attn_weights = scores
     if dropout_p > 0.0 and q._requires_grad:
         mask = (np.random.rand(*attn_weights.shape) > dropout_p).astype(
-            attn_weights.dtype) / (1.0 - dropout_p)
-        attn_weights = attn_weights * mask
-    result_data = np.matmul(attn_weights, v._data)
+            attn_weights.dtype)
+        inv_keep = 1.0 / (1.0 - dropout_p)
+        attn_weights = attn_weights * mask * inv_keep
+    if _USE_MPS and q._data.dtype == np.float32 and q._data.ndim >= 2:
+        result_data = _mops.accelerate_batched_matmul(attn_weights, v._data)
+    else:
+        result_data = np.matmul(attn_weights, v._data)
 
     rg = (q._requires_grad or k._requires_grad or
           v._requires_grad) and _ag.is_grad_enabled()

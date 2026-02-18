@@ -35,6 +35,10 @@ def _is_mps(device) -> bool:
     return device is not None and device._type == 'mps'
 
 
+# Singleton CPU device to avoid repeated Device('cpu') allocation
+_CPU_DEVICE = Device('cpu')
+
+
 class Tensor:
     """N-dimensional tensor with automatic differentiation.
 
@@ -75,7 +79,7 @@ class Tensor:
         self._requires_grad: bool = requires_grad
         self._grad: np.ndarray | None = None
         self._grad_fn: _ag.GradFn | None = None
-        self._device: Device = Device(device) if device is not None else Device('cpu')
+        self._device: Device = Device(device) if device is not None else _CPU_DEVICE
         self._version: int = 0
 
     # ------------------------------------------------------------------ #
@@ -217,7 +221,7 @@ class Tensor:
         t._requires_grad = requires_grad
         t._grad = None
         t._grad_fn = grad_fn
-        t._device = device or Device('cpu')
+        t._device = device if device is not None else _CPU_DEVICE
         t._version = 0
         return t
 
@@ -236,10 +240,19 @@ class Tensor:
     # ------------------------------------------------------------------ #
 
     def __add__(self, other):
-        b = _ensure_tensor(other)
+        if isinstance(other, (int, float)):
+            result_data = self._data + other
+            rg = self._requires_grad and _ag.is_grad_enabled()
+            if rg:
+                grad_fn = _ag.AddBackward()
+                b = _ensure_tensor(other)
+                grad_fn.inputs = [self, b]
+                return Tensor._wrap(result_data, True, grad_fn, self._device)
+            return Tensor._wrap(result_data, False, None, self._device)
+        b = other if isinstance(other, Tensor) else _ensure_tensor(other)
         result_data = self._data + b._data
-        grad_fn = None
         rg = self._needs_grad(b)
+        grad_fn = None
         if rg:
             grad_fn = _ag.AddBackward()
             grad_fn.inputs = [self, b]
@@ -249,10 +262,19 @@ class Tensor:
         return self.__add__(other)
 
     def __sub__(self, other):
-        b = _ensure_tensor(other)
+        if isinstance(other, (int, float)):
+            result_data = self._data - other
+            rg = self._requires_grad and _ag.is_grad_enabled()
+            if rg:
+                grad_fn = _ag.SubBackward()
+                b = _ensure_tensor(other)
+                grad_fn.inputs = [self, b]
+                return Tensor._wrap(result_data, True, grad_fn, self._device)
+            return Tensor._wrap(result_data, False, None, self._device)
+        b = other if isinstance(other, Tensor) else _ensure_tensor(other)
         result_data = self._data - b._data
-        grad_fn = None
         rg = self._needs_grad(b)
+        grad_fn = None
         if rg:
             grad_fn = _ag.SubBackward()
             grad_fn.inputs = [self, b]
@@ -263,10 +285,20 @@ class Tensor:
         return b.__sub__(self)
 
     def __mul__(self, other):
-        b = _ensure_tensor(other)
+        if isinstance(other, (int, float)):
+            result_data = self._data * other
+            rg = self._requires_grad and _ag.is_grad_enabled()
+            if rg:
+                b = _ensure_tensor(other)
+                grad_fn = _ag.MulBackward()
+                grad_fn.inputs = [self, b]
+                grad_fn.saved = {'a': self._data, 'b': b._data}
+                return Tensor._wrap(result_data, True, grad_fn, self._device)
+            return Tensor._wrap(result_data, False, None, self._device)
+        b = other if isinstance(other, Tensor) else _ensure_tensor(other)
         result_data = self._data * b._data
-        grad_fn = None
         rg = self._needs_grad(b)
+        grad_fn = None
         if rg:
             grad_fn = _ag.MulBackward()
             grad_fn.inputs = [self, b]
@@ -277,10 +309,20 @@ class Tensor:
         return self.__mul__(other)
 
     def __truediv__(self, other):
-        b = _ensure_tensor(other)
+        if isinstance(other, (int, float)):
+            result_data = self._data / other
+            rg = self._requires_grad and _ag.is_grad_enabled()
+            if rg:
+                b = _ensure_tensor(other)
+                grad_fn = _ag.DivBackward()
+                grad_fn.inputs = [self, b]
+                grad_fn.saved = {'a': self._data, 'b': b._data}
+                return Tensor._wrap(result_data, True, grad_fn, self._device)
+            return Tensor._wrap(result_data, False, None, self._device)
+        b = other if isinstance(other, Tensor) else _ensure_tensor(other)
         result_data = self._data / b._data
-        grad_fn = None
         rg = self._needs_grad(b)
+        grad_fn = None
         if rg:
             grad_fn = _ag.DivBackward()
             grad_fn.inputs = [self, b]
@@ -384,7 +426,7 @@ class Tensor:
         return self.__pow__(exp)
 
     def exp(self) -> 'Tensor':
-        if _USE_MPS and _is_mps(self._device):
+        if _USE_MPS:
             result_data = _mops.accelerate_exp(self._data)
         elif _USE_CYTHON:
             result_data = _cops.exp_forward(self._data)
@@ -399,7 +441,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def log(self) -> 'Tensor':
-        result_data = np.log(self._data)
+        if _USE_MPS:
+            result_data = _mops.accelerate_log(self._data)
+        else:
+            result_data = np.log(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -409,7 +454,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def sqrt(self) -> 'Tensor':
-        result_data = np.sqrt(self._data)
+        if _USE_MPS:
+            result_data = _mops.accelerate_sqrt(self._data)
+        else:
+            result_data = np.sqrt(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -419,7 +467,10 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def rsqrt(self) -> 'Tensor':
-        result_data = 1.0 / np.sqrt(self._data)
+        if _USE_MPS:
+            result_data = _mops.accelerate_rsqrt(self._data)
+        else:
+            result_data = 1.0 / np.sqrt(self._data)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -429,12 +480,14 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def sigmoid(self) -> 'Tensor':
-        if _USE_MPS and _is_mps(self._device):
+        if _USE_MPS:
             result_data = _mops.accelerate_sigmoid(self._data)
         elif _USE_CYTHON:
             result_data = _cops.sigmoid_forward(self._data)
         else:
-            result_data = 1.0 / (1.0 + np.exp(-self._data))
+            # Numerically stable sigmoid using np.clip to avoid overflow
+            x = np.clip(self._data, -88.0, 88.0)
+            result_data = 1.0 / (1.0 + np.exp(-x))
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -464,11 +517,7 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def clamp(self, min=None, max=None) -> 'Tensor':
-        result_data = self._data.copy()
-        if min is not None:
-            result_data = np.maximum(result_data, min)
-        if max is not None:
-            result_data = np.minimum(result_data, max)
+        result_data = np.clip(self._data, min, max)
         grad_fn = None
         rg = self._requires_grad and _ag.is_grad_enabled()
         if rg:
@@ -580,6 +629,8 @@ class Tensor:
         return Tensor._wrap(result_data, rg, grad_fn, self._device)
 
     def contiguous(self) -> 'Tensor':
+        if self._data.flags.c_contiguous:
+            return self
         return Tensor._wrap(np.ascontiguousarray(self._data),
                             self._requires_grad, self._grad_fn, self._device)
 
@@ -789,7 +840,7 @@ def _resolve_dtype(dtype) -> np.dtype | None:
 
 def _resolve_device(device) -> Device:
     if device is None:
-        return Device('cpu')
+        return _CPU_DEVICE
     if isinstance(device, Device):
         return device
     return Device(device)
@@ -896,8 +947,18 @@ def empty(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
 # ====================================================================
 
 def matmul(a: Tensor, b: Tensor) -> Tensor:
-    if _USE_MPS and _is_mps(a._device):
-        result_data = _mops.accelerate_sgemm(a._data, b._data)
+    if _USE_MPS:
+        a_data = a._data
+        b_data = b._data
+        if a_data.ndim >= 2 and b_data.ndim >= 2 and a_data.dtype == np.float32:
+            if a_data.ndim == 2 and b_data.ndim == 2:
+                result_data = _mops.blas_sgemm(
+                    np.ascontiguousarray(a_data),
+                    np.ascontiguousarray(b_data))
+            else:
+                result_data = _mops.accelerate_batched_matmul(a_data, b_data)
+        else:
+            result_data = np.matmul(a_data, b_data)
     elif _USE_CYTHON:
         result_data = _cops.matmul_forward(a._data, b._data)
     else:
@@ -927,8 +988,8 @@ def cat(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
 
 
 def stack(tensors: Sequence[Tensor], dim: int = 0) -> Tensor:
-    arrays = [np.expand_dims(t._data, axis=dim) for t in tensors]
-    result_data = np.concatenate(arrays, axis=dim)
+    arrays = [t._data for t in tensors]
+    result_data = np.stack(arrays, axis=dim)
     rg = any(t._requires_grad for t in tensors) and _ag.is_grad_enabled()
     grad_fn = None
     if rg:
@@ -1035,12 +1096,14 @@ def expm1(input: Tensor) -> Tensor:
 
 def softmax(input: Tensor, dim: int) -> Tensor:
     x = input._data
-    if _USE_MPS and _is_mps(input._device) and x.ndim == 2 and dim in (-1, x.ndim - 1):
+    if _USE_MPS and x.ndim == 2 and dim in (-1, x.ndim - 1) and x.dtype == np.float32:
         s = _mops.accelerate_softmax(x, dim)
     else:
-        x_max = np.max(x, axis=dim, keepdims=True)
+        x_max = x.max(axis=dim, keepdims=True)
         e = np.exp(x - x_max)
-        s = e / np.sum(e, axis=dim, keepdims=True)
+        e_sum = e.sum(axis=dim, keepdims=True)
+        np.divide(e, e_sum, out=e)
+        s = e
     rg = input._requires_grad and _ag.is_grad_enabled()
     grad_fn = None
     if rg:

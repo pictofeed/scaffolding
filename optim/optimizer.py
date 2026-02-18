@@ -12,7 +12,14 @@ from typing import Iterator
 from ..tensor import Tensor
 from ..nn.parameter import Parameter
 
-# Try Cython-accelerated AdamW step
+# Try Accelerate-backed AdamW step (preferred on macOS)
+try:
+    from .._mps_ops import accelerate_adamw_step as _accel_adamw
+    _USE_MPS_ADAM = True
+except ImportError:
+    _USE_MPS_ADAM = False
+
+# Try Cython-accelerated AdamW step (fallback)
 try:
     from .._tensor_ops import adamw_step_f32
     _USE_CYTHON_ADAM = True
@@ -40,13 +47,13 @@ class Optimizer:
         else:
             self.param_groups.append({**defaults, 'params': list(params)})
 
-    def zero_grad(self, set_to_none: bool = False):
+    def zero_grad(self, set_to_none: bool = True):
         for group in self.param_groups:
             for p in group['params']:
                 if set_to_none:
                     p._grad = None
                 elif p._grad is not None:
-                    p._grad = np.zeros_like(p._grad)
+                    p._grad.fill(0)
 
     def step(self):
         raise NotImplementedError
@@ -106,7 +113,11 @@ class AdamW(Optimizer):
                 bc1 = 1.0 - beta1 ** t
                 bc2 = 1.0 - beta2 ** t
 
-                if (_USE_CYTHON_ADAM and p._data.dtype == np.float32
+                if _USE_MPS_ADAM and p._data.dtype == np.float32:
+                    # Use Accelerate vDSP vectorized AdamW (fastest)
+                    _accel_adamw(p._data, grad, m, v,
+                                lr, beta1, beta2, eps, wd, bc1, bc2)
+                elif (_USE_CYTHON_ADAM and p._data.dtype == np.float32
                         and p._data.ndim <= 2):
                     # Use Cython nogil kernel
                     flat_p = np.ascontiguousarray(p._data, dtype=np.float32).ravel()
@@ -120,16 +131,21 @@ class AdamW(Optimizer):
                     st['m'] = flat_m.reshape(m.shape)
                     st['v'] = flat_v.reshape(v.shape)
                 else:
-                    # Pure Python path
-                    # Decoupled weight decay
-                    p._data *= (1.0 - lr * wd)
-                    # Moment updates
-                    m[:] = beta1 * m + (1.0 - beta1) * grad
-                    v[:] = beta2 * v + (1.0 - beta2) * (grad ** 2)
-                    # Bias-corrected moments
-                    m_hat = m / bc1
-                    v_hat = v / bc2
-                    # Update
-                    p._data -= lr * m_hat / (np.sqrt(v_hat) + eps)
+                    # Pure Python path — fused for fewer temporaries
+                    # Decoupled weight decay (in-place)
+                    if wd != 0:
+                        p._data *= (1.0 - lr * wd)
+                    # Moment updates (in-place)
+                    m *= beta1
+                    m += (1.0 - beta1) * grad
+                    v *= beta2
+                    np.multiply(grad, grad, out=grad)  # reuse grad buffer
+                    v += (1.0 - beta2) * grad
+                    # Bias-corrected update (fused, minimal temporaries)
+                    step_size = lr / bc1
+                    # Compute sqrt(v/bc2) + eps in-place using a temp
+                    denom = np.sqrt(v * (1.0 / bc2))
+                    denom += eps
+                    p._data -= step_size * (m / denom)
 
                 p._version += 1
