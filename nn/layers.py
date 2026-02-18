@@ -36,18 +36,26 @@ class Linear(Module):
     def forward(self, x: Tensor) -> Tensor:
         # GPU-resident fast path
         if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
-            # Ensure weight is on GPU
+            # Determine target device from input tensor
+            _target_dev = x._device._index if x._device._index is not None else 0
+            # Ensure weight is on the same GPU as input
             if self.weight._gpu is None and self.weight._data is not None:
                 self.weight._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(self.weight._data))
+                    np.ascontiguousarray(self.weight._data), _target_dev)
+            elif self.weight._gpu is not None and self.weight._gpu.device_id != _target_dev:
+                self.weight._gpu = _cuops.gputensor_to_device(self.weight._gpu, _target_dev)
             if self.weight._gpu is not None:
                 gt_bias = None
                 has_bias = self.bias is not None and isinstance(self.bias, Parameter)
                 if has_bias:
                     if self.bias._gpu is None and self.bias._data is not None:
                         self.bias._gpu = _cuops.gputensor_from_numpy(
-                            np.ascontiguousarray(self.bias._data))
+                            np.ascontiguousarray(self.bias._data), _target_dev)
+                    elif self.bias._gpu is not None and self.bias._gpu.device_id != _target_dev:
+                        self.bias._gpu = _cuops.gputensor_to_device(self.bias._gpu, _target_dev)
                     gt_bias = self.bias._gpu
+                # Set device context for kernel launch
+                _cuops.set_device(_target_dev)
                 return Tensor._wrap_gpu(
                     _cuops.dev_linear_forward(x._gpu, self.weight._gpu, gt_bias),
                     device=x._device)
@@ -107,10 +115,14 @@ class Embedding(Module):
     def forward(self, indices: Tensor) -> Tensor:
         # GPU-resident fast path
         if _USE_CUDA and _is_cuda(indices._device) and indices._gpu is not None:
+            _target_dev = indices._device._index if indices._device._index is not None else 0
             if self.weight._gpu is None and self.weight._data is not None:
                 self.weight._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(self.weight._data))
+                    np.ascontiguousarray(self.weight._data), _target_dev)
+            elif self.weight._gpu is not None and self.weight._gpu.device_id != _target_dev:
+                self.weight._gpu = _cuops.gputensor_to_device(self.weight._gpu, _target_dev)
             if self.weight._gpu is not None:
+                _cuops.set_device(_target_dev)
                 return Tensor._wrap_gpu(
                     _cuops.dev_embedding(self.weight._gpu, indices._gpu,
                                          self.embedding_dim),
@@ -499,19 +511,14 @@ class RMSNorm(Module):
 
 
 class DataParallel(Module):
-    """Single-node DataParallel stub.
+    """Compatibility alias — see nn.parallel.DataParallel for real impl.
 
-    In Scaffolding this is a no-op wrapper since we run on CPU/NumPy.
+    This stub delegates to the real DataParallel when CUDA is available,
+    otherwise falls through as a no-op wrapper.
     """
 
-    def __init__(self, module: Module, device_ids=None,
-                 output_device=None):
-        super().__init__()
-        self._modules['module'] = module
-
-    @property
-    def module(self) -> Module:
-        return self._modules['module']
-
-    def forward(self, *args, **kwargs):
-        return self.module(*args, **kwargs)
+    def __new__(cls, module: Module, device_ids=None,
+                output_device=None, **kwargs):
+        from .parallel import DataParallel as _RealDP
+        return _RealDP(module, device_ids=device_ids,
+                       output_device=output_device, **kwargs)

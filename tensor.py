@@ -97,7 +97,8 @@ class Tensor:
         self._gpu = None
         # Upload to GPU if CUDA device (float32 and int64)
         if _USE_CUDA and _is_cuda(self._device) and arr.dtype in (np.float32, np.int64):
-            self._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr))
+            target_dev = self._device._index if self._device._index is not None else 0
+            self._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), target_dev)
 
     # ------------------------------------------------------------------ #
     #  Properties                                                        #
@@ -961,15 +962,24 @@ class Tensor:
         t = Tensor._wrap(arr.copy(), self._requires_grad, None, new_device)
         # Upload to GPU if moving to CUDA
         if _USE_CUDA and _is_cuda(new_device) and t._data.dtype in (np.float32, np.int64):
-            t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data))
+            target_dev = new_device._index if new_device._index is not None else 0
+            # Cross-GPU: if already on a different GPU, use device copy
+            if self._gpu is not None and _is_cuda(self._device):
+                src_dev = self._device._index if self._device._index is not None else 0
+                if src_dev != target_dev:
+                    t._gpu = _cuops.gputensor_to_device(self._gpu, target_dev)
+                else:
+                    t._gpu = self._gpu
+            else:
+                t._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(t._data), target_dev)
         return t
 
     def cpu(self) -> 'Tensor':
         return self.to('cpu')
 
     def cuda(self, device_id: int | None = None) -> 'Tensor':
-        # Scaffolding runs on CPU; simply mark device
-        dev = f"cuda:{device_id}" if device_id is not None else "cuda"
+        dev = f"cuda:{device_id}" if device_id is not None else "cuda:0"
         return self.to(dev)
 
     def mps(self) -> 'Tensor':

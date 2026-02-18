@@ -188,7 +188,9 @@ class Module:
         return self
 
     def cuda(self, device=None) -> 'Module':
-        return self.to('cuda')
+        if device is not None:
+            return self.to(f'cuda:{device}')
+        return self.to('cuda:0')
 
     def cpu(self) -> 'Module':
         return self.to('cpu')

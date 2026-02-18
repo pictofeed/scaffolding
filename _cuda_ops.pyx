@@ -293,7 +293,7 @@ cdef class CudaBuffer:
 
     def __dealloc__(self):
         if self.owns_memory and self.ptr != NULL:
-            _cache_return(self.ptr, self.nbytes)
+            _cache_return(self.ptr, self.nbytes, self.device_id)
             self.ptr = NULL
 
     @property
@@ -348,73 +348,100 @@ cdef inline size_t _align_size(size_t nbytes) nogil:
     """Round nbytes up to GPU_ALLOC_ALIGN boundary."""
     return (nbytes + GPU_ALLOC_ALIGN - 1) & ~(<size_t>(GPU_ALLOC_ALIGN - 1))
 
-cdef dict _alloc_pool = {}          # nbytes → list[uintptr_t]
-cdef size_t _pool_bytes = 0         # total bytes cached
-cdef size_t _MAX_POOL = <size_t>(2 * 1024 * 1024 * 1024)   # 2 GB cap
+# Per-device caching allocator.  Keys are (device_id, nbytes).
+cdef dict _alloc_pool = {}                  # (dev, nbytes) → list[uintptr_t]
+cdef dict _pool_bytes_per_dev = {}          # dev → size_t
+cdef size_t _MAX_POOL_PER_DEV = <size_t>(2 * 1024 * 1024 * 1024)   # 2 GB cap per GPU
 
-cdef void* _cache_pop(size_t nbytes):
-    """Try to pop a cached pointer of exactly *nbytes*. Returns NULL if miss."""
-    global _pool_bytes
+cdef size_t _get_pool_bytes(int dev):
+    if dev in _pool_bytes_per_dev:
+        return <size_t>_pool_bytes_per_dev[dev]
+    return 0
+
+cdef void _set_pool_bytes(int dev, size_t val):
+    _pool_bytes_per_dev[dev] = val
+
+cdef void* _cache_pop(int dev, size_t nbytes):
+    """Try to pop a cached pointer for *dev* of exactly *nbytes*. Returns NULL if miss."""
+    cdef tuple key = (dev, nbytes)
     cdef list bucket
     cdef uintptr_t addr
-    if nbytes in _alloc_pool:
-        bucket = <list>_alloc_pool[nbytes]
+    if key in _alloc_pool:
+        bucket = <list>_alloc_pool[key]
         if len(bucket) > 0:
             addr = <uintptr_t>bucket.pop()
-            _pool_bytes -= nbytes
+            _set_pool_bytes(dev, _get_pool_bytes(dev) - nbytes)
             return <void*>addr
     return NULL
 
-cdef void _cache_return(void* ptr, size_t nbytes):
-    """Return a pointer to the cache (or cudaFree if pool is full)."""
-    global _pool_bytes
+cdef void _cache_return(void* ptr, size_t nbytes, int dev):
+    """Return a pointer to the per-device cache (or cudaFree if pool full)."""
     if ptr == NULL:
         return
     if _alloc_pool is None:
         # Interpreter shutting down
         cudaFree(ptr)
         return
-    if _pool_bytes + nbytes > _MAX_POOL:
+    cdef size_t cur = _get_pool_bytes(dev)
+    if cur + nbytes > _MAX_POOL_PER_DEV:
         cudaFree(ptr)
         return
+    cdef tuple key = (dev, nbytes)
     cdef list bucket
-    if nbytes not in _alloc_pool:
-        _alloc_pool[nbytes] = []
-    bucket = <list>_alloc_pool[nbytes]
+    if key not in _alloc_pool:
+        _alloc_pool[key] = []
+    bucket = <list>_alloc_pool[key]
     bucket.append(<uintptr_t>ptr)
-    _pool_bytes += nbytes
+    _set_pool_bytes(dev, cur + nbytes)
 
-def empty_cache():
-    """Free all cached GPU memory (like torch.cuda.empty_cache)."""
-    global _pool_bytes
-    cdef size_t nbytes
+def empty_cache(int device=-1):
+    """Free all cached GPU memory (like torch.cuda.empty_cache).
+    If device >= 0, free only that device's cache."""
+    cdef tuple key
     cdef list bucket
     cdef uintptr_t addr
-    for nbytes, bucket in _alloc_pool.items():
+    cdef list to_remove = []
+    for key, bucket in _alloc_pool.items():
+        if device >= 0 and key[0] != device:
+            continue
         for addr in bucket:
             cudaFree(<void*>addr)
-    _alloc_pool.clear()
-    _pool_bytes = 0
+        to_remove.append(key)
+    for key in to_remove:
+        del _alloc_pool[key]
+    if device >= 0:
+        _pool_bytes_per_dev[device] = 0
+    else:
+        _pool_bytes_per_dev.clear()
 
 
 cdef CudaBuffer _make_buffer(size_t nbytes, int device_id):
-    """Allocate a device buffer, reusing from cache when possible.
+    """Allocate a device buffer on *device_id*, reusing from per-device cache.
     
     Allocation is rounded up to GPU_ALLOC_ALIGN (256) bytes so that
     float4 vectorised kernels always have aligned loads/stores and
     GDDR5 cache-line coalescing is optimal.
+    
+    Automatically switches to target device and restores the previous one.
     """
     cdef size_t alloc_bytes = _align_size(nbytes) if nbytes > 0 else GPU_ALLOC_ALIGN
     cdef CudaBuffer buf = CudaBuffer.__new__(CudaBuffer)
-    cdef void* cached = _cache_pop(alloc_bytes)
+    cdef void* cached = _cache_pop(device_id, alloc_bytes)
     if cached != NULL:
         buf.ptr = cached
         buf.nbytes = alloc_bytes
         buf.device_id = device_id
         buf.owns_memory = True
         return buf
+    # Switch to target device for cudaMalloc
+    cdef int prev_dev = 0
+    cudaGetDevice(&prev_dev)
+    if prev_dev != device_id:
+        _check_cuda(cudaSetDevice(device_id))
     cdef cudaError_t err
     err = cudaMalloc(&buf.ptr, alloc_bytes)
+    if prev_dev != device_id:
+        cudaSetDevice(prev_dev)
     _check_cuda(err)
     buf.nbytes = alloc_bytes
     buf.device_id = device_id
@@ -491,6 +518,64 @@ def mem_info():
 
 
 # ================================================================
+#  PEER ACCESS (multi-GPU / K80 dual-die)
+# ================================================================
+
+cdef bint _p2p_initialized = False
+
+def can_access_peer(int device, int peer_device):
+    """Check if device can access peer_device's memory."""
+    cdef int can = 0
+    _check_cuda(cudaDeviceCanAccessPeer(&can, device, peer_device))
+    return bool(can)
+
+def enable_peer_access(int peer_device):
+    """Enable peer access from the current device to peer_device."""
+    _check_cuda(cudaDeviceEnablePeerAccess(peer_device, 0))
+
+def init_p2p():
+    """Enable peer-to-peer access between all GPU pairs.
+    Safe to call multiple times; only runs once."""
+    global _p2p_initialized
+    if _p2p_initialized:
+        return
+    cdef int n = 0
+    _check_cuda(cudaGetDeviceCount(&n))
+    if n < 2:
+        _p2p_initialized = True
+        return
+    cdef int i, j, can
+    cdef int prev_dev = 0
+    cudaGetDevice(&prev_dev)
+    for i in range(n):
+        _check_cuda(cudaSetDevice(i))
+        for j in range(n):
+            if i == j:
+                continue
+            can = 0
+            cudaDeviceCanAccessPeer(&can, i, j)
+            if can:
+                # Ignore error if already enabled
+                cudaDeviceEnablePeerAccess(j, 0)
+    _check_cuda(cudaSetDevice(prev_dev))
+    _p2p_initialized = True
+
+def init_all_devices():
+    """Initialize cuBLAS + cache config on all available devices.
+    Also enables P2P access between all GPU pairs."""
+    cdef int n = 0
+    _check_cuda(cudaGetDeviceCount(&n))
+    cdef int prev_dev = 0
+    cudaGetDevice(&prev_dev)
+    for i in range(n):
+        _check_cuda(cudaSetDevice(i))
+        # This triggers cuBLAS handle creation + cache config tuning
+        _get_cublas()
+    _check_cuda(cudaSetDevice(prev_dev))
+    init_p2p()
+
+
+# ================================================================
 #  STREAM MANAGEMENT
 # ================================================================
 
@@ -504,7 +589,14 @@ cdef class CudaStream:
         self._device_id = device_id
         self._owns = True
         cdef unsigned int flags = cudaStreamNonBlocking if non_blocking else cudaStreamDefault
+        # Ensure stream is created on the correct device
+        cdef int prev_dev = 0
+        cudaGetDevice(&prev_dev)
+        if prev_dev != device_id:
+            _check_cuda(cudaSetDevice(device_id))
         _check_cuda(cudaStreamCreateWithFlags(&self._stream, flags))
+        if prev_dev != device_id:
+            cudaSetDevice(prev_dev)
 
     def __dealloc__(self):
         if self._owns and self._stream != NULL:
@@ -568,42 +660,41 @@ cdef cudaStream_t _get_stream(stream) except *:
 
 
 # ================================================================
-#  cuBLAS HANDLE MANAGEMENT
+#  cuBLAS HANDLE MANAGEMENT — per-device
 # ================================================================
 
-cdef cublasHandle_t _cublas_handle = NULL
-cdef bint _cublas_init = False
+cdef dict _cublas_handles = {}       # device_id → cublasHandle_t (as int)
+cdef set _cublas_tuned_devs = set()  # devices that had cache config applied
 
 cdef cublasHandle_t _get_cublas() except *:
-    global _cublas_handle, _cublas_init
-    cdef cublasStatus_t status
-    cdef cudaDeviceProp prop
+    """Get (or create) a cuBLAS handle for the currently-active device."""
     cdef int dev = 0
+    cdef cublasStatus_t status
+    cdef cublasHandle_t handle
+    cdef cudaDeviceProp prop
     cdef int sm = 0
-    if not _cublas_init:
-        status = cublasCreate(&_cublas_handle)
-        if status != CUBLAS_STATUS_SUCCESS:
-            raise RuntimeError(f"cuBLAS init failed: {status}")
-        _cublas_init = True
 
-        # ------- K80 / Kepler device-level tuning at first init -------
-        # Detect GPU architecture and apply K80-specific settings.
-        cudaGetDevice(&dev)
+    cudaGetDevice(&dev)
+
+    if dev in _cublas_handles:
+        return <cublasHandle_t><uintptr_t>_cublas_handles[dev]
+
+    # First time on this device — create handle + tune
+    status = cublasCreate(&handle)
+    if status != CUBLAS_STATUS_SUCCESS:
+        raise RuntimeError(f"cuBLAS init failed on device {dev}: {status}")
+    _cublas_handles[dev] = <uintptr_t>handle
+
+    if dev not in _cublas_tuned_devs:
+        _cublas_tuned_devs.add(dev)
         cudaGetDeviceProperties(&prop, dev)
         sm = prop.major * 10 + prop.minor
-
         if sm <= 37:
-            # K80/Kepler: prefer 48 KB L1 / 16 KB shared globally.
-            # All bandwidth-bound kernels benefit (element-wise, AdamW,
-            # layer norm, dropout, etc.).  Individual kernels can still
-            # override with cudaFuncSetCacheConfig.
             cudaDeviceSetCacheConfig(cudaFuncCachePreferL1)
         elif sm < 70:
-            # Maxwell/Pascal: equal L1/shared is a good default
             cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual)
-        # Volta+ manages L1/shared automatically
 
-    return _cublas_handle
+    return handle
 
 def cublas_set_stream(stream=None):
     """Set the cuBLAS handle stream."""
@@ -689,28 +780,38 @@ def gpu_to_numpy(CudaBuffer buf, tuple shape, dtype, stream=None):
 
 class GpuTensor:
     """GPU-resident tensor wrapping a CudaBuffer with shape/dtype metadata."""
-    __slots__ = ('buffer', 'shape', 'dtype', 'numel')
+    __slots__ = ('buffer', 'shape', 'dtype', 'numel', 'device_id')
 
-    def __init__(self, buffer, tuple shape, dtype):
+    def __init__(self, buffer, tuple shape, dtype, int device_id=-1):
         self.buffer = buffer
         self.shape = shape
         self.dtype = dtype
+        self.device_id = device_id if device_id >= 0 else (<CudaBuffer>buffer).device_id
         cdef int64_t n = 1
         for s in shape:
             n *= s
         self.numel = n
 
 
-def gputensor_from_numpy(np.ndarray arr not None):
-    """Upload NumPy array to GPU, return GpuTensor."""
+def gputensor_from_numpy(np.ndarray arr not None, int device_id=-1):
+    """Upload NumPy array to GPU, return GpuTensor.
+    If device_id >= 0, allocate on that specific device."""
     cdef np.ndarray flat = np.ascontiguousarray(arr).ravel()
     cdef size_t nbytes = flat.nbytes
-    cdef int device = 0
-    cudaGetDevice(&device)
-    cdef CudaBuffer buf = _make_buffer(nbytes, device)
+    cdef int target_dev = device_id
+    cdef int prev_dev = 0
+    if target_dev < 0:
+        cudaGetDevice(&target_dev)
+    cdef CudaBuffer buf = _make_buffer(nbytes, target_dev)
+    # Set target device for the memcpy
+    cudaGetDevice(&prev_dev)
+    if prev_dev != target_dev:
+        _check_cuda(cudaSetDevice(target_dev))
     _check_cuda(cudaMemcpy(buf.ptr, <void*>np.PyArray_DATA(flat),
                            nbytes, cudaMemcpyHostToDevice))
-    return GpuTensor(buf, (<object>arr).shape, arr.dtype)
+    if prev_dev != target_dev:
+        cudaSetDevice(prev_dev)
+    return GpuTensor(buf, (<object>arr).shape, arr.dtype, target_dev)
 
 
 def gputensor_to_numpy(gt):
@@ -718,23 +819,50 @@ def gputensor_to_numpy(gt):
     cdef CudaBuffer buf = <CudaBuffer>(gt.buffer)
     cdef np.ndarray result = np.empty(gt.shape, dtype=gt.dtype)
     cdef size_t nbytes = result.nbytes
+    # Switch to the tensor's device for the D2H copy
+    cdef int prev_dev = 0
+    cdef int tgt = gt.device_id
+    cudaGetDevice(&prev_dev)
+    if prev_dev != tgt:
+        _check_cuda(cudaSetDevice(tgt))
     _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(result), buf.ptr,
                            nbytes, cudaMemcpyDeviceToHost))
+    if prev_dev != tgt:
+        cudaSetDevice(prev_dev)
     return result
 
 
-cdef CudaBuffer _gt_alloc(int64_t numel):
-    """Alloc an f32 device buffer for numel elements."""
-    cdef int device = 0
-    cudaGetDevice(&device)
-    return _make_buffer(numel * sizeof(float), device)
+def gputensor_to_device(gt, int target_dev):
+    """Copy a GpuTensor to a different device via cudaMemcpyPeer.
+    Returns a new GpuTensor on the target device."""
+    cdef int src_dev = gt.device_id
+    if src_dev == target_dev:
+        return gt
+    cdef CudaBuffer src_buf = <CudaBuffer>(gt.buffer)
+    cdef size_t nbytes = gt.numel * sizeof(float)
+    if gt.dtype == np.int64:
+        nbytes = gt.numel * sizeof(int64_t)
+    cdef CudaBuffer dst_buf = _make_buffer(nbytes, target_dev)
+    # Use D2D copy (peer access should be enabled)
+    _check_cuda(cudaMemcpy(dst_buf.ptr, src_buf.ptr,
+                           nbytes, cudaMemcpyDeviceToDevice))
+    return GpuTensor(dst_buf, gt.shape, gt.dtype, target_dev)
 
 
-cdef CudaBuffer _gt_alloc_bytes(size_t nbytes):
-    """Alloc a device buffer for given bytes."""
-    cdef int device = 0
-    cudaGetDevice(&device)
-    return _make_buffer(nbytes, device)
+cdef CudaBuffer _gt_alloc(int64_t numel, int device_id=-1):
+    """Alloc an f32 device buffer for numel elements on specified device."""
+    cdef int dev = device_id
+    if dev < 0:
+        cudaGetDevice(&dev)
+    return _make_buffer(numel * sizeof(float), dev)
+
+
+cdef CudaBuffer _gt_alloc_bytes(size_t nbytes, int device_id=-1):
+    """Alloc a device buffer for given bytes on specified device."""
+    cdef int dev = device_id
+    if dev < 0:
+        cudaGetDevice(&dev)
+    return _make_buffer(nbytes, dev)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -746,12 +874,13 @@ cdef CudaBuffer _gt_alloc_bytes(size_t nbytes):
 cdef _dev_unary(gt, int (*kernel)(const float*, float*, int64_t, cudaStream_t) noexcept nogil):
     cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
     cdef int64_t n = gt.numel
-    cdef CudaBuffer dst = _gt_alloc(n)
+    cdef int dev = gt.device_id
+    cdef CudaBuffer dst = _gt_alloc(n, dev)
     cdef int ret
     with nogil:
         ret = kernel(<float*>src.ptr, <float*>dst.ptr, n, _default_stream)
     _check_kernel(ret)
-    return GpuTensor(dst, gt.shape, gt.dtype)
+    return GpuTensor(dst, gt.shape, gt.dtype, dev)
 
 def dev_exp(gt):
     return _dev_unary(gt, cuda_exp_f32)
@@ -799,12 +928,13 @@ cdef _dev_binary(gt_a, gt_b, int (*kernel)(const float*, const float*, float*, i
     cdef CudaBuffer a = <CudaBuffer>(gt_a.buffer)
     cdef CudaBuffer b = <CudaBuffer>(gt_b.buffer)
     cdef int64_t n = gt_a.numel
-    cdef CudaBuffer c = _gt_alloc(n)
+    cdef int dev = gt_a.device_id
+    cdef CudaBuffer c = _gt_alloc(n, dev)
     cdef int ret
     with nogil:
         ret = kernel(<float*>a.ptr, <float*>b.ptr, <float*>c.ptr, n, _default_stream)
     _check_kernel(ret)
-    return GpuTensor(c, gt_a.shape, gt_a.dtype)
+    return GpuTensor(c, gt_a.shape, gt_a.dtype, dev)
 
 def dev_add(gt_a, gt_b):
     return _dev_binary(gt_a, gt_b, cuda_add_f32)

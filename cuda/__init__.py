@@ -300,6 +300,28 @@ def is_tf32_enabled() -> bool:
 
 
 # ================================================================
+#  MULTI-GPU (K80 dual-die)
+# ================================================================
+
+def init_multi_gpu() -> int:
+    """Initialize all GPUs, enable P2P, and return device count.
+    Safe to call multiple times."""
+    if not _CUDA_AVAILABLE:
+        return 0
+    n = device_count()
+    if n > 1:
+        _cops.init_all_devices()
+    return n
+
+
+def can_access_peer(device: int, peer_device: int) -> bool:
+    """Check if device can access peer_device's memory."""
+    if not _CUDA_AVAILABLE:
+        return False
+    return _cops.can_access_peer(device, peer_device)
+
+
+# ================================================================
 #  RNG
 # ================================================================
 
@@ -324,6 +346,8 @@ __all__ = [
     'get_device_capability', 'get_device_name', 'get_device_properties',
     # Device control
     'set_device', 'current_device', 'synchronize',
+    # Multi-GPU
+    'init_multi_gpu', 'can_access_peer',
     # Memory
     'memory_allocated', 'max_memory_allocated',
     'memory_reserved', 'max_memory_reserved',
