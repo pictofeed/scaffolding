@@ -552,7 +552,7 @@ class GpuTensor:
     """GPU-resident tensor wrapping a CudaBuffer with shape/dtype metadata."""
     __slots__ = ('buffer', 'shape', 'dtype', 'numel')
 
-    def __init__(self, CudaBuffer buffer, tuple shape, dtype):
+    def __init__(self, buffer, tuple shape, dtype):
         self.buffer = buffer
         self.shape = shape
         self.dtype = dtype
