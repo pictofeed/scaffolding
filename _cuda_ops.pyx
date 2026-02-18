@@ -251,8 +251,9 @@ cdef extern from "_cuda_kernels.cuh" nogil:
 # ================================================================
 
 cdef inline void _check_cuda(cudaError_t err) except *:
+    cdef const char* msg
     if err != cudaSuccess:
-        cdef const char* msg = cudaGetErrorString(err)
+        msg = cudaGetErrorString(err)
         raise RuntimeError(f"CUDA error: {msg.decode('utf-8')}")
 
 cdef inline void _check_kernel(int ret) except *:
