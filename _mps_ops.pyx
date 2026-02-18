@@ -35,6 +35,10 @@ from libc.math cimport tanh as c_tanh, fmax, fmin
 from libc.string cimport memset, memcpy
 from libc.stdlib cimport malloc, free
 
+cdef extern from "math.h" nogil:
+    float expf(float x)
+    float tanhf(float x)
+
 import numpy as np
 cimport numpy as np
 
@@ -600,6 +604,181 @@ cpdef tuple accelerate_silu_1d_fwd(FLOAT32[::1] x):
 
 @cython.boundscheck(False)
 @cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] gelu_fused_1d(FLOAT32[::1] x):
+    """GELU via single-pass fused C loop (auto-vectorised by Clang -O3).
+
+    0.5 * x * (1 + tanh(sqrt(2/pi) * (x + 0.044715 * x^3)))
+    Single pass over data = minimal memory traffic.
+    """
+    cdef Py_ssize_t n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef Py_ssize_t i
+    cdef float xi, x3, inner, t
+    cdef float coeff = 0.044715
+    cdef float scale = 0.7978845608  # sqrt(2/pi)
+    with nogil:
+        for i in range(n):
+            xi = x[i]
+            x3 = xi * xi * xi
+            inner = scale * (xi + coeff * x3)
+            t = tanhf(inner)
+            out[i] = 0.5 * xi * (1.0 + t)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] gelu_tiled_1d(FLOAT32[::1] x):
+    """GELU with cache-tiled vectorized processing.
+
+    Processes data in L2-sized chunks so all 9 vDSP/vecLib operations
+    execute while data is hot in cache, minimising memory traffic.
+    """
+    cdef Py_ssize_t n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef Py_ssize_t TILE = 16384  # 64KB working set fits in L2
+    cdef Py_ssize_t start, chunk
+    cdef float *tmp = <float *>malloc(TILE * sizeof(float))
+    cdef float *th  = <float *>malloc(TILE * sizeof(float))
+    cdef float coeff = 0.044715
+    cdef float scale = 0.7978845608  # sqrt(2/pi)
+    cdef float one = 1.0
+    cdef float half = 0.5
+    cdef int cn
+    cdef unsigned long uchunk
+    if tmp == NULL or th == NULL:
+        free(tmp); free(th)
+        raise MemoryError("gelu_tiled_1d: allocation failed")
+    with nogil:
+        start = 0
+        while start < n:
+            chunk = n - start
+            if chunk > TILE:
+                chunk = TILE
+            uchunk = <unsigned long>chunk
+            cn = <int>chunk
+            # x^2
+            vDSP_vsq(&x[start], 1, tmp, 1, uchunk)
+            # x^3
+            vDSP_vmul(tmp, 1, &x[start], 1, tmp, 1, uchunk)
+            # 0.044715 * x^3
+            vDSP_vsmul(tmp, 1, &coeff, tmp, 1, uchunk)
+            # x + 0.044715 * x^3
+            vDSP_vadd(&x[start], 1, tmp, 1, tmp, 1, uchunk)
+            # sqrt(2/pi) * (...)
+            vDSP_vsmul(tmp, 1, &scale, tmp, 1, uchunk)
+            # tanh(...)
+            vvtanhf(th, tmp, &cn)
+            # 1 + tanh(...)
+            vDSP_vsadd(th, 1, &one, th, 1, uchunk)
+            # 0.5 * x
+            vDSP_vsmul(&x[start], 1, &half, &out[start], 1, uchunk)
+            # 0.5 * x * (1 + tanh(...))
+            vDSP_vmul(&out[start], 1, th, 1, &out[start], 1, uchunk)
+            start = start + TILE
+    free(tmp); free(th)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] silu_fused_1d(FLOAT32[::1] x):
+    """SiLU via single-pass fused C loop (auto-vectorised).
+
+    x * sigmoid(x) = x / (1 + exp(-x))
+    """
+    cdef Py_ssize_t n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef Py_ssize_t i
+    cdef float xi, sig
+    with nogil:
+        for i in range(n):
+            xi = x[i]
+            sig = 1.0 / (1.0 + expf(-xi))
+            out[i] = xi * sig
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray[FLOAT32, ndim=1] silu_tiled_1d(FLOAT32[::1] x):
+    """SiLU with cache-tiled vectorized processing."""
+    cdef Py_ssize_t n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef Py_ssize_t TILE = 16384
+    cdef Py_ssize_t start, chunk
+    cdef float *neg = <float *>malloc(TILE * sizeof(float))
+    cdef float *sig = <float *>malloc(TILE * sizeof(float))
+    cdef float one = 1.0
+    cdef int cn
+    cdef unsigned long uchunk
+    if neg == NULL or sig == NULL:
+        free(neg); free(sig)
+        raise MemoryError("silu_tiled_1d: allocation failed")
+    with nogil:
+        start = 0
+        while start < n:
+            chunk = n - start
+            if chunk > TILE:
+                chunk = TILE
+            uchunk = <unsigned long>chunk
+            cn = <int>chunk
+            # -x
+            vDSP_vneg(&x[start], 1, neg, 1, uchunk)
+            # exp(-x)
+            vvexpf(sig, neg, &cn)
+            # 1 + exp(-x)
+            vDSP_vsadd(sig, 1, &one, sig, 1, uchunk)
+            # 1 / (1 + exp(-x))
+            vvrecf(sig, sig, &cn)
+            # x * sigmoid(x)
+            vDSP_vmul(&x[start], 1, sig, 1, &out[start], 1, uchunk)
+            start = start + TILE
+    free(neg); free(sig)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef tuple silu_tiled_1d_fwd(FLOAT32[::1] x):
+    """SiLU tiled forward returning (result, sigmoid)."""
+    cdef Py_ssize_t n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    cdef np.ndarray sig_arr = np.empty(n, dtype=np.float32)
+    cdef float *sig_final = <float *>np.PyArray_DATA(sig_arr)
+    cdef Py_ssize_t TILE = 16384
+    cdef Py_ssize_t start, chunk
+    cdef float *neg = <float *>malloc(TILE * sizeof(float))
+    cdef float one = 1.0
+    cdef int cn
+    cdef unsigned long uchunk
+    if neg == NULL:
+        raise MemoryError("silu_tiled_1d_fwd: allocation failed")
+    with nogil:
+        start = 0
+        while start < n:
+            chunk = n - start
+            if chunk > TILE:
+                chunk = TILE
+            uchunk = <unsigned long>chunk
+            cn = <int>chunk
+            vDSP_vneg(&x[start], 1, neg, 1, uchunk)
+            vvexpf(&sig_final[start], neg, &cn)
+            vDSP_vsadd(&sig_final[start], 1, &one, &sig_final[start], 1, uchunk)
+            vvrecf(&sig_final[start], &sig_final[start], &cn)
+            vDSP_vmul(&x[start], 1, &sig_final[start], 1, &out[start], 1, uchunk)
+            start = start + TILE
+    free(neg)
+    return (result, sig_arr)
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
 cpdef np.ndarray[FLOAT32, ndim=2] accelerate_rms_norm_2d(
         FLOAT32[:, ::1] x, FLOAT32[::1] weight, float eps):
     """RMS normalisation via vDSP: x * rsqrt(mean(x^2) + eps) * weight.
@@ -784,41 +963,46 @@ def accelerate_sgemm(np.ndarray a not None, np.ndarray b not None):
 
 
 def accelerate_sigmoid(np.ndarray x not None):
-    """Sigmoid dispatch — flat + call Accelerate kernel + reshape."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    """Sigmoid dispatch."""
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return accelerate_sigmoid_1d(flat).reshape(shape)
     return 1.0 / (1.0 + np.exp(-x))
 
 
 def accelerate_exp(np.ndarray x not None):
     """Exp dispatch."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return veclib_expf(flat).reshape(shape)
-    elif flat.dtype == np.float64:
+    elif x.dtype == np.float64:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return veclib_exp(flat).reshape(shape)
     return np.exp(x)
 
 
 def accelerate_silu(np.ndarray x not None):
-    """SiLU dispatch."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    """SiLU dispatch — uses cache-tiled vectorized kernel."""
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
-        return accelerate_silu_1d(flat).reshape(shape)
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return silu_tiled_1d(flat).reshape(shape)
     sig = 1.0 / (1.0 + np.exp(-x))
     return x * sig
 
 
 def accelerate_silu_fwd(np.ndarray x not None):
     """SiLU forward returning (result, sigmoid) for backward reuse."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
-        res, sig = accelerate_silu_1d_fwd(flat)
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        res, sig = silu_tiled_1d_fwd(flat)
         return res.reshape(shape), sig.reshape(shape)
     sig = 1.0 / (1.0 + np.exp(-x))
     return x * sig, sig
@@ -826,9 +1010,10 @@ def accelerate_silu_fwd(np.ndarray x not None):
 
 def accelerate_relu(np.ndarray x not None):
     """ReLU dispatch via vDSP_vclip."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return accelerate_relu_1d(flat).reshape(shape)
     return np.maximum(x, 0)
 
@@ -857,38 +1042,42 @@ def accelerate_softmax(np.ndarray x not None, int axis=-1):
 
 
 def accelerate_gelu(np.ndarray x not None):
-    """GELU dispatch."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    """GELU dispatch — uses cache-tiled vectorized kernel."""
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
-        return accelerate_gelu_1d(flat).reshape(shape)
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return gelu_tiled_1d(flat).reshape(shape)
     return 0.5 * x * (1.0 + np.tanh(
         np.sqrt(2.0 / np.pi) * (x + 0.044715 * x ** 3)))
 
 
 def accelerate_log(np.ndarray x not None):
     """Log dispatch via vecLib."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return veclib_logf(flat).reshape(shape)
     return np.log(x)
 
 
 def accelerate_sqrt(np.ndarray x not None):
     """Sqrt dispatch via vecLib."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return veclib_sqrtf(flat).reshape(shape)
     return np.sqrt(x)
 
 
 def accelerate_tanh(np.ndarray x not None):
     """Tanh dispatch via vecLib."""
-    cdef np.ndarray flat = np.ascontiguousarray(x).ravel()
+    cdef np.ndarray flat
     cdef tuple shape = (<object>x).shape
-    if flat.dtype == np.float32:
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
         return veclib_tanhf(flat).reshape(shape)
     return np.tanh(x)
 
