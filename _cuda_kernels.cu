@@ -146,14 +146,38 @@ DEFINE_UNARY_LAUNCHER(abs, AbsOp)
 
 /* ================================================================
  *  ELEMENT-WISE BINARY KERNELS
+ *
+ *  Float4-vectorised for 4x memory throughput, matching unary pattern.
  * ================================================================ */
 
+/* ---- Vectorised float4 binary kernel template ---- */
 template <typename Func>
-__global__ void binary_f32_kernel(const float* __restrict__ a,
-                                  const float* __restrict__ b,
-                                  float* __restrict__ c,
-                                  int64_t n, Func fn) {
-    GRID_STRIDE_LOOP(i, n) {
+__global__ void elementwise_binary_f32_kernel(const float* __restrict__ a,
+                                              const float* __restrict__ b,
+                                              float* __restrict__ c,
+                                              int64_t n, Func fn) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    const float4* a4 = reinterpret_cast<const float4*>(a);
+    const float4* b4 = reinterpret_cast<const float4*>(b);
+    float4* c4 = reinterpret_cast<float4*>(c);
+
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 va = a4[i];
+        float4 vb = b4[i];
+        float4 vc;
+        vc.x = fn(va.x, vb.x);
+        vc.y = fn(va.y, vb.y);
+        vc.z = fn(va.z, vb.z);
+        vc.w = fn(va.w, vb.w);
+        c4[i] = vc;
+    }
+
+    /* Handle tail elements (n % 4 != 0) */
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         c[i] = fn(LDG(&a[i]), LDG(&b[i]));
     }
 }
@@ -161,15 +185,21 @@ __global__ void binary_f32_kernel(const float* __restrict__ a,
 struct AddOp { __device__ __forceinline__ float operator()(float a, float b) const { return a + b; } };
 struct SubOp { __device__ __forceinline__ float operator()(float a, float b) const { return a - b; } };
 struct MulOp { __device__ __forceinline__ float operator()(float a, float b) const { return a * b; } };
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+struct DivOp { __device__ __forceinline__ float operator()(float a, float b) const { return __fdividef(a, b); } };
+#else
 struct DivOp { __device__ __forceinline__ float operator()(float a, float b) const { return a / b; } };
+#endif
 
 #define DEFINE_BINARY_LAUNCHER(name, OpStruct)                                \
 extern "C" int cuda_##name##_f32(const float* a, const float* b, float* c,    \
                                  int64_t n, cudaStream_t stream) {            \
     if (n == 0) return 0;                                                     \
     int block = BLOCK_1D;                                                     \
-    int grid = grid_size(n, block);                                           \
-    binary_f32_kernel<<<grid, block, 0, stream>>>(a, b, c, n, OpStruct());    \
+    int64_t work = (n + 3) / 4;                                               \
+    int grid = grid_size(work, block);                                        \
+    elementwise_binary_f32_kernel<<<grid, block, 0, stream>>>(                \
+        a, b, c, n, OpStruct());                                              \
     CUDA_CHECK(cudaGetLastError());                                           \
     return 0;                                                                 \
 }
@@ -181,19 +211,45 @@ DEFINE_BINARY_LAUNCHER(div, DivOp)
 
 
 /* ================================================================
- *  SCALAR BROADCAST BINARY KERNELS
+ *  SCALAR BROADCAST BINARY KERNELS (float4-vectorised)
  * ================================================================ */
 
 __global__ void adds_f32_kernel(const float* __restrict__ a, float s,
                                 float* __restrict__ c, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    const float4* a4 = reinterpret_cast<const float4*>(a);
+    float4* c4 = reinterpret_cast<float4*>(c);
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 va = a4[i];
+        float4 vc;
+        vc.x = va.x + s; vc.y = va.y + s;
+        vc.z = va.z + s; vc.w = va.w + s;
+        c4[i] = vc;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         c[i] = LDG(&a[i]) + s;
     }
 }
 
 __global__ void muls_f32_kernel(const float* __restrict__ a, float s,
                                 float* __restrict__ c, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    const float4* a4 = reinterpret_cast<const float4*>(a);
+    float4* c4 = reinterpret_cast<float4*>(c);
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 va = a4[i];
+        float4 vc;
+        vc.x = va.x * s; vc.y = va.y * s;
+        vc.z = va.z * s; vc.w = va.w * s;
+        c4[i] = vc;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         c[i] = LDG(&a[i]) * s;
     }
 }
@@ -202,7 +258,8 @@ extern "C" int cuda_adds_f32(const float* a, float scalar, float* c,
                              int64_t n, cudaStream_t stream) {
     if (n == 0) return 0;
     int block = BLOCK_1D;
-    int grid_s = grid_size(n, block);
+    int64_t work = (n + 3) / 4;
+    int grid_s = grid_size(work, block);
     adds_f32_kernel<<<grid_s, block, 0, stream>>>(a, scalar, c, n);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -212,7 +269,8 @@ extern "C" int cuda_muls_f32(const float* a, float scalar, float* c,
                              int64_t n, cudaStream_t stream) {
     if (n == 0) return 0;
     int block = BLOCK_1D;
-    int grid_s = grid_size(n, block);
+    int64_t work = (n + 3) / 4;
+    int grid_s = grid_size(work, block);
     muls_f32_kernel<<<grid_s, block, 0, stream>>>(a, scalar, c, n);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -233,6 +291,41 @@ struct GeluOp  { __device__ __forceinline__ float operator()(float x) const { re
 
 /* ---- ReLU forward (vectorised via DEFINE_UNARY_LAUNCHER below) ---- */
 
+/* Float4-vectorised backward kernel template for 2-input patterns */
+template <typename BackwardFunc>
+__global__ void elementwise_backward2_f32_kernel(const float* __restrict__ grad,
+                                                  const float* __restrict__ x,
+                                                  float* __restrict__ dx,
+                                                  int64_t n,
+                                                  BackwardFunc fn) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    const float4* g4 = reinterpret_cast<const float4*>(grad);
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    float4* d4 = reinterpret_cast<float4*>(dx);
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 vg = g4[i];
+        float4 vx = x4[i];
+        float4 vd;
+        vd.x = fn(vg.x, vx.x);
+        vd.y = fn(vg.y, vx.y);
+        vd.z = fn(vg.z, vx.z);
+        vd.w = fn(vg.w, vx.w);
+        d4[i] = vd;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
+        dx[i] = fn(LDG(&grad[i]), LDG(&x[i]));
+    }
+}
+
+struct ReluBackOp {
+    __device__ __forceinline__ float operator()(float g, float x) const {
+        return x > 0.0f ? g : 0.0f;
+    }
+};
+
 __global__ void relu_backward_f32_kernel(const float* __restrict__ grad,
                                          const float* __restrict__ x,
                                          float* __restrict__ dx, int64_t n) {
@@ -247,7 +340,11 @@ DEFINE_UNARY_LAUNCHER(relu, ReluOp)
 extern "C" int cuda_relu_backward_f32(const float* grad, const float* x,
                                       float* dx, int64_t n, cudaStream_t stream) {
     if (n == 0) return 0;
-    relu_backward_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(grad, x, dx, n);
+    int block = BLOCK_1D;
+    int64_t work = (n + 3) / 4;
+    int grid = grid_size(work, block);
+    elementwise_backward2_f32_kernel<<<grid, block, 0, stream>>>(
+        grad, x, dx, n, ReluBackOp());
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
@@ -260,7 +357,11 @@ __global__ void silu_fwd_f32_kernel(const float* __restrict__ x,
                                     float* __restrict__ sig, int64_t n) {
     GRID_STRIDE_LOOP(i, n) {
         float v = LDG(&x[i]);
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+        float s = __fdividef(1.0f, 1.0f + __expf(-v));
+#else
         float s = 1.0f / (1.0f + expf(-v));
+#endif
         sig[i] = s;
         y[i] = v * s;
     }
@@ -315,7 +416,11 @@ __global__ void gelu_backward_f32_kernel(const float* __restrict__ grad,
         float t = tanhf(inner);
         float dtanh = 1.0f - t * t;
         float dinner = kS2Pi * (1.0f + 3.0f * kC * x2);
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
         dx[i] = g * (0.5f * (1.0f + t) + 0.5f * xi * dtanh * dinner);
+#else
+        dx[i] = g * (0.5f * (1.0f + t) + 0.5f * xi * dtanh * dinner);
+#endif
     }
 }
 
@@ -560,11 +665,21 @@ __global__ void log_softmax_f32_kernel(const float* __restrict__ x,
 
     float local_sum = 0.0f;
     for (int j = threadIdx.x; j < cols; j += blockDim.x) {
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+        local_sum += __expf(LDG(&x_row[j]) - row_max);
+#else
         local_sum += expf(LDG(&x_row[j]) - row_max);
+#endif
     }
     local_sum = block_reduce_sum(local_sum);
     __shared__ float s_lse;
-    if (threadIdx.x == 0) s_lse = logf(local_sum) + row_max;
+    if (threadIdx.x == 0) {
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+        s_lse = __logf(local_sum) + row_max;
+#else
+        s_lse = logf(local_sum) + row_max;
+#endif
+    }
     __syncthreads();
     float lse = s_lse;
 
@@ -576,9 +691,18 @@ __global__ void log_softmax_f32_kernel(const float* __restrict__ x,
 extern "C" int cuda_log_softmax_f32(const float* x, float* y,
                                     int rows, int cols, cudaStream_t stream) {
     if (rows == 0 || cols == 0) return 0;
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+    int block = 256;
+    if (cols <= 32) block = 32;
+    else if (cols <= 64) block = 64;
+    else if (cols <= 128) block = 128;
+    else if (cols <= 256) block = 256;
+    else block = 512;
+#else
     int block = (cols <= 1024) ? ((cols + 31) / 32 * 32) : 1024;
     if (block < 32) block = 32;
     if (block > 1024) block = 1024;
+#endif
     log_softmax_f32_kernel<<<rows, block, 0, stream>>>(x, y, rows, cols);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -685,11 +809,21 @@ extern "C" int cuda_cross_entropy_fwd_f32(const float* logits,
  *  REDUCTION KERNELS
  * ================================================================ */
 
-/* Global sum reduction — two-phase: per-block partial sums → final sum */
+/* Global sum reduction — two-phase: per-block partial sums → final sum.
+ * Float4-vectorised for 4x memory throughput on bandwidth-bound reduction. */
 __global__ void sum_f32_kernel(const float* __restrict__ x, float* __restrict__ out,
                                int64_t n) {
     float sum = 0.0f;
-    GRID_STRIDE_LOOP(i, n) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    const float4* x4 = reinterpret_cast<const float4*>(x);
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 v = x4[i];
+        sum += v.x + v.y + v.z + v.w;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         sum += LDG(&x[i]);
     }
     sum = block_reduce_sum(sum);
@@ -705,10 +839,12 @@ extern "C" int cuda_sum_f32(const float* x, float* out, int64_t n, cudaStream_t 
 #if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
     /* K80: 13 SMXs, cap blocks to avoid over-subscription with atomicAdd */
     int block = BLOCK_1D;
-    int grid_s = grid_size(n, block, 256);
+    int64_t work = (n + 3) / 4;
+    int grid_s = grid_size(work, block, 256);
 #else
     int block = 256;
-    int grid_s = grid_size(n, block, 1024);  /* cap at 1024 blocks for atomicAdd */
+    int64_t work = (n + 3) / 4;
+    int grid_s = grid_size(work, block, 1024);  /* cap at 1024 blocks for atomicAdd */
 #endif
     sum_f32_kernel<<<grid_s, block, 0, stream>>>(x, out, n);
     CUDA_CHECK(cudaGetLastError());
@@ -753,7 +889,126 @@ extern "C" int cuda_sum_dim_f32(const float* x, float* out,
  *  Input: (N, D) — normalise each row.
  *  Outputs: y, mean, rstd (reciprocal standard deviation).
  *  One block per row.
+ *
+ *  K80 optimisation: Welford's online algorithm computes mean and
+ *  variance in a SINGLE PASS, halving global memory reads (one scan
+ *  instead of two). This is critical on K80's 240 GB/s GDDR5 where
+ *  bandwidth is the bottleneck.  The warp-level merge uses Welford's
+ *  parallel combine formula.
  * ================================================================ */
+
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+/* Welford single-pass kernel: reads data ONCE, computes mean+var together */
+__global__ void layer_norm_f32_kernel(const float* __restrict__ x,
+                                     const float* __restrict__ gamma,
+                                     const float* __restrict__ beta,
+                                     float* __restrict__ y,
+                                     float* __restrict__ mean_out,
+                                     float* __restrict__ rstd_out,
+                                     int N, int D, float eps) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    const float* x_row = x + (int64_t)row * D;
+    float* y_row = y + (int64_t)row * D;
+
+    /* Welford's online algorithm — each thread accumulates its portion */
+    float mean = 0.0f;
+    float m2 = 0.0f;
+    int count = 0;
+
+    for (int j = threadIdx.x; j < D; j += blockDim.x) {
+        float val = LDG(&x_row[j]);
+        count++;
+        float delta = val - mean;
+        mean += __fdividef(delta, (float)count);
+        float delta2 = val - mean;
+        m2 += delta * delta2;
+    }
+
+    /* Parallel Welford reduction across the block */
+    /* First, intra-warp reduction using shuffles */
+    int lane = threadIdx.x & (WARP_SIZE - 1);
+    int wid = threadIdx.x / WARP_SIZE;
+
+    #pragma unroll
+    for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+        float o_mean = SHFL_DOWN(mean, offset);
+        float o_m2 = SHFL_DOWN(m2, offset);
+        int o_count = __float_as_int(SHFL_DOWN(__int_as_float(count), offset));
+        if (o_count > 0) {
+            int new_count = count + o_count;
+            float delta = o_mean - mean;
+            float new_mean = mean + __fdividef(delta * (float)o_count, (float)new_count);
+            float new_m2 = m2 + o_m2 + delta * delta * __fdividef((float)count * (float)o_count, (float)new_count);
+            mean = new_mean;
+            m2 = new_m2;
+            count = new_count;
+        }
+    }
+
+    /* Inter-warp reduction via shared memory */
+    __shared__ float s_mean[32];
+    __shared__ float s_m2[32];
+    __shared__ int s_count[32];
+
+    if (lane == 0) {
+        s_mean[wid] = mean;
+        s_m2[wid] = m2;
+        s_count[wid] = count;
+    }
+    __syncthreads();
+
+    int num_warps = (blockDim.x + WARP_SIZE - 1) / WARP_SIZE;
+    if (wid == 0) {
+        mean = (threadIdx.x < num_warps) ? s_mean[threadIdx.x] : 0.0f;
+        m2 = (threadIdx.x < num_warps) ? s_m2[threadIdx.x] : 0.0f;
+        count = (threadIdx.x < num_warps) ? s_count[threadIdx.x] : 0;
+
+        #pragma unroll
+        for (int offset = WARP_SIZE / 2; offset > 0; offset >>= 1) {
+            float o_mean = SHFL_DOWN(mean, offset);
+            float o_m2 = SHFL_DOWN(m2, offset);
+            int o_count = __float_as_int(SHFL_DOWN(__int_as_float(count), offset));
+            if (o_count > 0) {
+                int new_count = count + o_count;
+                float delta = o_mean - mean;
+                float new_mean = mean + __fdividef(delta * (float)o_count, (float)new_count);
+                float new_m2 = m2 + o_m2 + delta * delta * __fdividef((float)count * (float)o_count, (float)new_count);
+                mean = new_mean;
+                m2 = new_m2;
+                count = new_count;
+            }
+        }
+    }
+
+    __shared__ float s_mu, s_rstd;
+    if (threadIdx.x == 0) {
+        s_mu = mean;
+        float var = __fdividef(m2, (float)D);
+        s_rstd = rsqrtf(var + eps);
+    }
+    __syncthreads();
+    float mu = s_mu;
+    float rstd = s_rstd;
+
+    /* Normalise + affine — second pass (unavoidable, need mean/rstd first) */
+    for (int j = threadIdx.x; j < D; j += blockDim.x) {
+        float xhat = (LDG(&x_row[j]) - mu) * rstd;
+        if (gamma != nullptr && beta != nullptr) {
+            y_row[j] = xhat * LDG(&gamma[j]) + LDG(&beta[j]);
+        } else {
+            y_row[j] = xhat;
+        }
+    }
+
+    if (threadIdx.x == 0) {
+        if (mean_out != nullptr) mean_out[row] = mu;
+        if (rstd_out != nullptr) rstd_out[row] = rstd;
+    }
+}
+
+#else  /* !K80/Kepler: standard 2-pass */
 
 __global__ void layer_norm_f32_kernel(const float* __restrict__ x,
                                      const float* __restrict__ gamma,
@@ -809,6 +1064,8 @@ __global__ void layer_norm_f32_kernel(const float* __restrict__ x,
         if (rstd_out != nullptr) rstd_out[row] = rstd;
     }
 }
+
+#endif  /* SCAFFOLDING_K80 || SCAFFOLDING_KEPLER */
 
 extern "C" int cuda_layer_norm_f32(const float* x, const float* gamma,
                                    const float* beta, float* y,
@@ -886,11 +1143,18 @@ extern "C" int cuda_rms_norm_f32(const float* x, const float* gamma,
                                  float* y, float* rstd,
                                  int N, int D, float eps, cudaStream_t stream) {
     if (N == 0 || D == 0) return 0;
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+    int block = 256;
+    if (D <= 64) block = 64;
+    else if (D <= 128) block = 128;
+    else block = 256;
+#else
     int block = 256;
     if (D <= 64) block = 64;
     else if (D <= 128) block = 128;
     else if (D <= 512) block = 512;
     else block = 1024;
+#endif
     rms_norm_f32_kernel<<<N, block, 0, stream>>>(x, gamma, y, rstd, N, D, eps);
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -997,6 +1261,7 @@ extern "C" int cuda_sgemm_batched(cublasHandle_t handle,
  *    - __launch_bounds__ to hint register allocation
  *    - Use __fdividef and rsqrtf for fast division and inverse sqrt
  *    - 128-thread blocks for maximum block-level parallelism
+ *    - Float4 vectorisation for 4x memory throughput
  * ================================================================ */
 
 #if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
@@ -1010,22 +1275,65 @@ __global__ void adamw_step_f32_kernel(float* __restrict__ param,
                                       float eps, float wd,
                                       float bc1, float bc2,
                                       int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
+    /* Float4 vectorised path for 4x memory throughput */
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+
+    float4* p4 = reinterpret_cast<float4*>(param);
+    const float4* g4 = reinterpret_cast<const float4*>(grad);
+    float4* m4 = reinterpret_cast<float4*>(m);
+    float4* v4 = reinterpret_cast<float4*>(v);
+
+    for (int64_t i = tid; i < n4; i += stride) {
+        float4 pp = p4[i];
+        float4 gg = g4[i];
+        float4 mm = m4[i];
+        float4 vv = v4[i];
+
+        #pragma unroll
+        for (int k = 0; k < 4; k++) {
+            float p_k = (&pp.x)[k];
+            float g_k = (&gg.x)[k];
+            float m_k = (&mm.x)[k];
+            float v_k = (&vv.x)[k];
+
+            p_k -= lr * wd * p_k;
+            m_k = beta1 * m_k + (1.0f - beta1) * g_k;
+            v_k = beta2 * v_k + (1.0f - beta2) * g_k * g_k;
+
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+            float m_hat = __fdividef(m_k, bc1);
+            float v_hat = __fdividef(v_k, bc2);
+            p_k -= lr * __fdividef(m_hat, sqrtf(v_hat) + eps);
+#else
+            float m_hat = m_k / bc1;
+            float v_hat = v_k / bc2;
+            p_k -= lr * m_hat / (sqrtf(v_hat) + eps);
+#endif
+            (&pp.x)[k] = p_k;
+            (&mm.x)[k] = m_k;
+            (&vv.x)[k] = v_k;
+        }
+
+        p4[i] = pp;
+        m4[i] = mm;
+        v4[i] = vv;
+    }
+
+    /* Tail elements */
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         float p = param[i];
         float g = LDG(&grad[i]);
         float mi = m[i];
         float vi = v[i];
 
-        /* Weight decay (decoupled) */
         p -= lr * wd * p;
-
-        /* Moment updates */
         mi = beta1 * mi + (1.0f - beta1) * g;
         vi = beta2 * vi + (1.0f - beta2) * g * g;
 
-        /* Bias-corrected update */
 #if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
-        /* SFU-accelerated division on Kepler */
         float m_hat = __fdividef(mi, bc1);
         float v_hat = __fdividef(vi, bc2);
         p -= lr * __fdividef(m_hat, sqrtf(v_hat) + eps);
@@ -1034,8 +1342,6 @@ __global__ void adamw_step_f32_kernel(float* __restrict__ param,
         float v_hat = vi / bc2;
         p -= lr * m_hat / (sqrtf(v_hat) + eps);
 #endif
-
-        /* Write back */
         param[i] = p;
         m[i] = mi;
         v[i] = vi;
@@ -1061,7 +1367,8 @@ extern "C" int cuda_adamw_step_f32(float* param, const float* grad,
 #else
     int block = BLOCK_1D;
 #endif
-    int grid_s = grid_size(n, block);
+    int64_t work = (n + 3) / 4;
+    int grid_s = grid_size(work, block);
     adamw_step_f32_kernel<<<grid_s, block, 0, stream>>>(
         param, grad, m, v, lr, beta1, beta2, eps, wd, bc1, bc2, n);
     CUDA_CHECK(cudaGetLastError());
@@ -1070,18 +1377,29 @@ extern "C" int cuda_adamw_step_f32(float* param, const float* grad,
 
 
 /* ================================================================
- *  MEMORY UTILITY KERNELS
+ *  MEMORY UTILITY KERNELS (float4-vectorised)
  * ================================================================ */
 
 __global__ void fill_f32_kernel(float* __restrict__ ptr, float value, int64_t n) {
-    GRID_STRIDE_LOOP(i, n) {
+    int64_t n4 = n / 4;
+    int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+    int64_t stride = (int64_t)blockDim.x * gridDim.x;
+    float4* p4 = reinterpret_cast<float4*>(ptr);
+    float4 val4;
+    val4.x = value; val4.y = value; val4.z = value; val4.w = value;
+    for (int64_t i = tid; i < n4; i += stride) {
+        p4[i] = val4;
+    }
+    int64_t base = n4 * 4;
+    for (int64_t i = base + tid; i < n; i += stride) {
         ptr[i] = value;
     }
 }
 
 extern "C" int cuda_fill_f32(float* ptr, float value, int64_t n, cudaStream_t stream) {
     if (n == 0) return 0;
-    fill_f32_kernel<<<grid_size(n, BLOCK_1D), BLOCK_1D, 0, stream>>>(ptr, value, n);
+    int64_t work = (n + 3) / 4;
+    fill_f32_kernel<<<grid_size(work, BLOCK_1D), BLOCK_1D, 0, stream>>>(ptr, value, n);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
@@ -1104,8 +1422,13 @@ extern "C" int cuda_copy_f32(const float* src, float* dst, int64_t n, cudaStream
 
 /* ================================================================
  *  DROPOUT WITH cuRAND
+ *
+ *  K80 optimisation: __launch_bounds__ for occupancy hint.
  * ================================================================ */
 
+#if SCAFFOLDING_K80 || SCAFFOLDING_KEPLER
+__launch_bounds__(128, 16)
+#endif
 __global__ void dropout_f32_kernel(const float* __restrict__ x,
                                    float* __restrict__ y,
                                    float* __restrict__ mask,
@@ -1151,14 +1474,35 @@ extern "C" int cuda_dropout_f32(const float* x, float* y, float* mask,
 
 /* ================================================================
  *  ROW-WISE BIAS ADD — C[i,j] += bias[j]  for i in [0, M)
+ *
+ *  K80 optimisation: float4-vectorised when N is divisible by 4.
+ *  Falls back to scalar for non-aligned N.
  * ================================================================ */
 
 __global__ void bias_add_row_f32_kernel(float* __restrict__ C,
                                         const float* __restrict__ bias,
                                         int M, int N) {
-    int64_t total = (int64_t)M * N;
-    GRID_STRIDE_LOOP(idx, total) {
-        C[idx] += LDG(&bias[idx % N]);
+    /* Check if N is float4-aligned for vectorised path */
+    if ((N & 3) == 0) {
+        int N4 = N / 4;
+        int64_t total4 = (int64_t)M * N4;
+        int64_t tid = (int64_t)blockIdx.x * blockDim.x + threadIdx.x;
+        int64_t stride = (int64_t)blockDim.x * gridDim.x;
+        float4* C4 = reinterpret_cast<float4*>(C);
+        const float4* b4 = reinterpret_cast<const float4*>(bias);
+        for (int64_t i = tid; i < total4; i += stride) {
+            int col4 = (int)(i % N4);
+            float4 cv = C4[i];
+            float4 bv = b4[col4];
+            cv.x += bv.x; cv.y += bv.y;
+            cv.z += bv.z; cv.w += bv.w;
+            C4[i] = cv;
+        }
+    } else {
+        int64_t total = (int64_t)M * N;
+        GRID_STRIDE_LOOP(idx, total) {
+            C[idx] += LDG(&bias[idx % N]);
+        }
     }
 }
 
@@ -1166,15 +1510,17 @@ extern "C" int cuda_bias_add_row_f32(float* C, const float* bias,
                                      int M, int N, cudaStream_t stream) {
     int64_t total = (int64_t)M * N;
     if (total == 0) return 0;
-    bias_add_row_f32_kernel<<<grid_size(total, BLOCK_1D), BLOCK_1D, 0, stream>>>(
-        C, bias, M, N);
+    int block = BLOCK_1D;
+    int64_t work = ((N & 3) == 0) ? ((int64_t)M * (N / 4)) : total;
+    int grid = grid_size(work, block);
+    bias_add_row_f32_kernel<<<grid, block, 0, stream>>>(C, bias, M, N);
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
 
 /* ================================================================
- *  EMBEDDING FORWARD
+ *  EMBEDDING FORWARD (float4-vectorised)
  * ================================================================ */
 
 __global__ void embedding_f32_kernel(const float* __restrict__ weight,
@@ -1188,8 +1534,18 @@ __global__ void embedding_f32_kernel(const float* __restrict__ weight,
     const float* src = weight + row * embed_dim;
     float* dst = output + (int64_t)idx * embed_dim;
 
-    for (int j = threadIdx.x; j < embed_dim; j += blockDim.x) {
-        dst[j] = LDG(&src[j]);
+    /* Float4 vectorised copy when embed_dim is aligned */
+    if ((embed_dim & 3) == 0) {
+        int ed4 = embed_dim / 4;
+        const float4* src4 = reinterpret_cast<const float4*>(src);
+        float4* dst4 = reinterpret_cast<float4*>(dst);
+        for (int j = threadIdx.x; j < ed4; j += blockDim.x) {
+            dst4[j] = src4[j];
+        }
+    } else {
+        for (int j = threadIdx.x; j < embed_dim; j += blockDim.x) {
+            dst[j] = LDG(&src[j]);
+        }
     }
 }
 
@@ -1197,9 +1553,18 @@ extern "C" int cuda_embedding_f32(const float* weight, const int64_t* indices,
                                   float* output, int num_indices, int embed_dim,
                                   cudaStream_t stream) {
     if (num_indices == 0) return 0;
-    int block = 256;
-    if (embed_dim <= 64) block = 64;
-    else if (embed_dim <= 128) block = 128;
+    int block;
+    if ((embed_dim & 3) == 0) {
+        /* With float4, each thread handles 4 elements, so fewer threads needed */
+        int ed4 = embed_dim / 4;
+        block = 64;
+        if (ed4 > 64) block = 128;
+        if (ed4 > 128) block = 256;
+    } else {
+        block = 256;
+        if (embed_dim <= 64) block = 64;
+        else if (embed_dim <= 128) block = 128;
+    }
     embedding_f32_kernel<<<num_indices, block, 0, stream>>>(
         weight, indices, output, num_indices, embed_dim);
     CUDA_CHECK(cudaGetLastError());

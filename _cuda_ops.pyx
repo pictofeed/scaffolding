@@ -112,6 +112,15 @@ cdef extern from "cuda_runtime.h" nogil:
     enum:
         cudaSuccess = 0
 
+    # Device cache config (L1 vs shared memory preference)
+    enum:
+        cudaFuncCachePreferNone = 0
+        cudaFuncCachePreferShared = 1
+        cudaFuncCachePreferL1 = 2
+        cudaFuncCachePreferEqual = 3
+
+    cudaError_t cudaDeviceSetCacheConfig(int cacheConfig)
+
 
 # ================================================================
 #  cuBLAS extern declarations
@@ -325,7 +334,19 @@ def _rebuild_cuda_buffer(np.ndarray arr):
 #  Avoids cudaMalloc/cudaFree per-op (~0.5-1ms each on K80).
 #  Freed buffers go to a size-keyed pool; next alloc of the same
 #  size reuses them instantly.
+#
+#  K80 optimisation: all allocations are rounded up to 256-byte
+#  alignment.  This ensures float4 loads are always aligned and
+#  matches GDDR5 cache-line boundaries for optimal coalescing.
 # ================================================================
+
+# Alignment for all GPU allocations — 256 bytes matches GDDR5
+# burst length and guarantees float4 alignment for vectorised kernels.
+DEF GPU_ALLOC_ALIGN = 256
+
+cdef inline size_t _align_size(size_t nbytes) nogil:
+    """Round nbytes up to GPU_ALLOC_ALIGN boundary."""
+    return (nbytes + GPU_ALLOC_ALIGN - 1) & ~(<size_t>(GPU_ALLOC_ALIGN - 1))
 
 cdef dict _alloc_pool = {}          # nbytes → list[uintptr_t]
 cdef size_t _pool_bytes = 0         # total bytes cached
@@ -377,19 +398,25 @@ def empty_cache():
 
 
 cdef CudaBuffer _make_buffer(size_t nbytes, int device_id):
-    """Allocate a device buffer, reusing from cache when possible."""
+    """Allocate a device buffer, reusing from cache when possible.
+    
+    Allocation is rounded up to GPU_ALLOC_ALIGN (256) bytes so that
+    float4 vectorised kernels always have aligned loads/stores and
+    GDDR5 cache-line coalescing is optimal.
+    """
+    cdef size_t alloc_bytes = _align_size(nbytes) if nbytes > 0 else GPU_ALLOC_ALIGN
     cdef CudaBuffer buf = CudaBuffer.__new__(CudaBuffer)
-    cdef void* cached = _cache_pop(nbytes)
+    cdef void* cached = _cache_pop(alloc_bytes)
     if cached != NULL:
         buf.ptr = cached
-        buf.nbytes = nbytes
+        buf.nbytes = alloc_bytes
         buf.device_id = device_id
         buf.owns_memory = True
         return buf
     cdef cudaError_t err
-    err = cudaMalloc(&buf.ptr, nbytes)
+    err = cudaMalloc(&buf.ptr, alloc_bytes)
     _check_cuda(err)
-    buf.nbytes = nbytes
+    buf.nbytes = alloc_bytes
     buf.device_id = device_id
     buf.owns_memory = True
     return buf
@@ -550,11 +577,31 @@ cdef bint _cublas_init = False
 cdef cublasHandle_t _get_cublas() except *:
     global _cublas_handle, _cublas_init
     cdef cublasStatus_t status
+    cdef cudaDeviceProp prop
     if not _cublas_init:
         status = cublasCreate(&_cublas_handle)
         if status != CUBLAS_STATUS_SUCCESS:
             raise RuntimeError(f"cuBLAS init failed: {status}")
         _cublas_init = True
+
+        # ------- K80 / Kepler device-level tuning at first init -------
+        # Detect GPU architecture and apply K80-specific settings.
+        cdef int dev = 0
+        cudaGetDevice(&dev)
+        cudaGetDeviceProperties(&prop, dev)
+        cdef int sm = prop.major * 10 + prop.minor
+
+        if sm <= 37:
+            # K80/Kepler: prefer 48 KB L1 / 16 KB shared globally.
+            # All bandwidth-bound kernels benefit (element-wise, AdamW,
+            # layer norm, dropout, etc.).  Individual kernels can still
+            # override with cudaFuncSetCacheConfig.
+            cudaDeviceSetCacheConfig(cudaFuncCachePreferL1)
+        elif sm < 70:
+            # Maxwell/Pascal: equal L1/shared is a good default
+            cudaDeviceSetCacheConfig(cudaFuncCachePreferEqual)
+        # Volta+ manages L1/shared automatically
+
     return _cublas_handle
 
 def cublas_set_stream(stream=None):
