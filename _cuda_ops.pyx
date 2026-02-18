@@ -1017,18 +1017,20 @@ def dev_sum(gt):
 def dev_fill(gt, float value):
     """Fill GpuTensor with scalar value (in-place)."""
     cdef CudaBuffer buf = <CudaBuffer>(gt.buffer)
+    cdef int64_t n = gt.numel
     cdef int ret
     with nogil:
-        ret = cuda_fill_f32(<float*>buf.ptr, value, gt.numel, _default_stream)
+        ret = cuda_fill_f32(<float*>buf.ptr, value, n, _default_stream)
     _check_kernel(ret)
 
 def dev_copy(gt_src, gt_dst):
     """Copy device → device."""
     cdef CudaBuffer src = <CudaBuffer>(gt_src.buffer)
     cdef CudaBuffer dst = <CudaBuffer>(gt_dst.buffer)
+    cdef int64_t n = gt_src.numel
     cdef int ret
     with nogil:
-        ret = cuda_copy_f32(<float*>src.ptr, <float*>dst.ptr, gt_src.numel, _default_stream)
+        ret = cuda_copy_f32(<float*>src.ptr, <float*>dst.ptr, n, _default_stream)
     _check_kernel(ret)
 
 
