@@ -943,11 +943,13 @@ def dev_linear_forward(gt_x, gt_weight, gt_bias=None):
     cdef int M = gt_x.numel // gt_x.shape[len(gt_x.shape) - 1]
     cdef int K = gt_x.shape[len(gt_x.shape) - 1]
     cdef int N = gt_weight.shape[0]
-
-    # Reshape x to 2D for matmul
     cdef CudaBuffer x_buf = <CudaBuffer>(gt_x.buffer)
     cdef CudaBuffer w_buf = <CudaBuffer>(gt_weight.buffer)
     cdef CudaBuffer c_buf = _gt_alloc(M * N)
+    cdef CudaBuffer b_buf
+    cdef np.ndarray c_np
+    cdef np.ndarray b_np
+    cdef tuple out_shape
 
     cdef cublasHandle_t handle = _get_cublas()
     cdef int ret = cuda_sgemm(handle, M, N, K,
@@ -957,23 +959,18 @@ def dev_linear_forward(gt_x, gt_weight, gt_bias=None):
 
     # Add bias if present
     if gt_bias is not None:
-        # Broadcast add: result[i] += bias for each row
-        # We need to download, add, upload — but bias is small
-        # Better: use a kernel. For now use adds row-by-row via a simple loop kernel
-        # Actually, just do it via the add kernel with broadcasting
-        cdef CudaBuffer b_buf = <CudaBuffer>(gt_bias.buffer)
-        # We need a proper broadcast add kernel, fall back to download/upload for bias
-        cdef np.ndarray c_np = np.empty((M, N), dtype=np.float32)
+        b_buf = <CudaBuffer>(gt_bias.buffer)
+        c_np = np.empty((M, N), dtype=np.float32)
         _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(c_np), c_buf.ptr,
                                M * N * sizeof(float), cudaMemcpyDeviceToHost))
-        cdef np.ndarray b_np = np.empty(N, dtype=np.float32)
+        b_np = np.empty(N, dtype=np.float32)
         _check_cuda(cudaMemcpy(<void*>np.PyArray_DATA(b_np), b_buf.ptr,
                                N * sizeof(float), cudaMemcpyDeviceToHost))
         c_np += b_np
         _check_cuda(cudaMemcpy(c_buf.ptr, <void*>np.PyArray_DATA(c_np),
                                M * N * sizeof(float), cudaMemcpyHostToDevice))
 
-    cdef tuple out_shape = gt_x.shape[:-1] + (N,)
+    out_shape = gt_x.shape[:-1] + (N,)
     return GpuTensor(c_buf, out_shape, np.float32)
 
 
