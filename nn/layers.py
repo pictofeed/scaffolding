@@ -281,22 +281,8 @@ class Dropout(Module):
     def forward(self, x: Tensor) -> Tensor:
         if not self._training or self.p == 0.0:
             return x
-        # GPU-resident fast path via functional
-        if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
-            from . import functional as F
-            return F.dropout(x, self.p, True)
-        x._ensure_cpu()
-        mask = (np.random.rand(*x._data.shape) > self.p).astype(x._data.dtype)
-        scale = 1.0 / (1.0 - self.p)
-        result_data = x._data * mask * scale
-
-        rg = x._requires_grad and _ag.is_grad_enabled()
-        grad_fn = None
-        if rg:
-            grad_fn = _ag.DropoutBackward()
-            grad_fn.inputs = [x]
-            grad_fn.saved = {'mask': mask * scale}
-        return Tensor._wrap(result_data, rg, grad_fn, x._device)
+        from . import functional as F
+        return F.dropout(x, self.p, True)
 
     def __repr__(self) -> str:
         return f"Dropout(p={self.p})"

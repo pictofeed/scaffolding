@@ -8,7 +8,7 @@ from __future__ import annotations
 import math
 import numpy as np
 
-from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _USE_CUDA, _mops, _cops, _cuops, _is_cuda
+from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _USE_CUDA, _mops, _cops, _cuops, _is_cuda, _f32_rng
 from .. import autograd as _ag
 
 
@@ -238,9 +238,15 @@ def dropout(input: Tensor, p: float = 0.5,
             return Tensor._wrap_gpu(result_gpu, device=input._device)
         result_data, mask = _cuops.cuda_dropout(input._ensure_cpu(), p)
         mask = mask.astype(input._data.dtype) / (1.0 - p)
+    elif _USE_MPS and isinstance(input._data, np.ndarray) and input._data.dtype == np.float32:
+        x = input._ensure_cpu()
+        result_data, mask = _mops.accelerate_dropout(x, p)
     else:
         x = input._ensure_cpu()
-        mask = (np.random.rand(*x.shape) > p).astype(x.dtype)
+        if x.dtype == np.float32:
+            mask = (_f32_rng.random(x.shape, dtype=np.float32) > p).astype(np.float32)
+        else:
+            mask = (np.random.rand(*x.shape) > p).astype(x.dtype)
         scale = 1.0 / (1.0 - p)
         result_data = x * mask * scale
         mask = mask * scale
@@ -267,7 +273,9 @@ def pad(input: Tensor, pad_widths, mode: str = 'constant',
     # PyTorch pads from last dim; numpy from first
     np_pad = [(0, 0)] * (ndim - len(pairs)) + list(reversed(pairs))
 
-    if mode == 'constant':
+    if mode == 'constant' and _USE_MPS and input._data.dtype == np.float32 and input._data.ndim == 3:
+        result_data = _mops.accelerate_pad_3d(input._data, np_pad, value)
+    elif mode == 'constant':
         result_data = np.pad(input._data, np_pad, mode='constant',
                              constant_values=value)
     else:

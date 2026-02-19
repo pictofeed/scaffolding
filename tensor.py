@@ -13,6 +13,9 @@ from . import autograd as _ag
 from .device import device as Device
 from .dtype import dtype as Dtype
 
+# Fast float32 RNG – numpy Generator generates f32 directly, avoiding f64→f32 copy
+_f32_rng = np.random.default_rng()
+
 # Try to import Cython-accelerated ops; fall back to pure-Python
 try:
     from . import _tensor_ops as _cops
@@ -756,7 +759,7 @@ class Tensor:
             result_data = _cuops.cuda_rsqrt(self._data)
         elif _USE_MPS:
             self._ensure_cpu()
-            result_data = _mops.accelerate_rsqrt(self._data)
+            result_data = _mops.accelerate_rsqrt_fused(self._data)
         else:
             self._ensure_cpu()
             result_data = 1.0 / np.sqrt(self._data)
@@ -799,6 +802,9 @@ class Tensor:
                 return Tensor._wrap_gpu(_cuops.dev_sin(self._gpu), device=self._device)
             self._ensure_cpu()
             result_data = _cuops.cuda_sin(self._data)
+        elif _USE_MPS:
+            self._ensure_cpu()
+            result_data = _mops.accelerate_sin(self._data)
         else:
             self._ensure_cpu()
             result_data = np.sin(self._data)
@@ -816,6 +822,9 @@ class Tensor:
                 return Tensor._wrap_gpu(_cuops.dev_cos(self._gpu), device=self._device)
             self._ensure_cpu()
             result_data = _cuops.cuda_cos(self._data)
+        elif _USE_MPS:
+            self._ensure_cpu()
+            result_data = _mops.accelerate_cos(self._data)
         else:
             self._ensure_cpu()
             result_data = np.cos(self._data)
@@ -924,8 +933,10 @@ class Tensor:
         self._ensure_cpu()
         indices = np.nonzero(self._data)
         if as_tuple:
-            return tuple(Tensor._wrap(np.asarray(idx), device=self._device) for idx in indices)
-        return Tensor._wrap(np.stack(indices, axis=-1), device=self._device)
+            return tuple(Tensor._wrap(idx.astype(np.int64, copy=False), device=self._device) for idx in indices)
+        # Stack into (N, ndim) int64 result
+        stacked = np.stack(indices, axis=-1)
+        return Tensor._wrap(stacked.astype(np.int64, copy=False), device=self._device)
 
     # ---- Shape methods ----
 
@@ -1037,8 +1048,8 @@ class Tensor:
         self._ensure_cpu()
         if self._data.flags.c_contiguous:
             return self
-        return Tensor._wrap(np.ascontiguousarray(self._data),
-                            self._requires_grad, self._grad_fn, self._device)
+        cdata = np.array(self._data, dtype=self._data.dtype, order='C', copy=True)
+        return Tensor._wrap(cdata, self._requires_grad, self._grad_fn, self._device)
 
     def chunk(self, chunks: int, dim: int = 0) -> tuple['Tensor', ...]:
         # GPU-resident fast path
@@ -1083,6 +1094,8 @@ class Tensor:
 
     def float(self) -> 'Tensor':
         self._ensure_cpu()
+        if self._data.dtype == np.float32:
+            return self
         return Tensor._wrap(self._data.astype(np.float32),
                             self._requires_grad, None, self._device)
 
@@ -1355,7 +1368,10 @@ def randn(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
     if len(size) == 1 and isinstance(size[0], (tuple, list)):
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
-    arr = np.random.randn(*size).astype(dt)
+    if dt == np.float32:
+        arr = _f32_rng.standard_normal(size, dtype=np.float32)
+    else:
+        arr = np.random.randn(*size).astype(dt)
     return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
@@ -1363,7 +1379,10 @@ def rand(*size, dtype=None, device=None, requires_grad=False) -> Tensor:
     if len(size) == 1 and isinstance(size[0], (tuple, list)):
         size = tuple(size[0])
     dt = _resolve_dtype(dtype) or np.float32
-    arr = np.random.rand(*size).astype(dt)
+    if dt == np.float32:
+        arr = _f32_rng.random(size, dtype=np.float32)
+    else:
+        arr = np.random.rand(*size).astype(dt)
     return _make_tensor(arr, requires_grad, _resolve_device(device))
 
 
@@ -1436,7 +1455,7 @@ def matmul(a: Tensor, b: Tensor) -> Tensor:
                 b_c = b_data if b_data.flags.c_contiguous else np.ascontiguousarray(b_data)
                 result_data = _mops.blas_sgemm(a_c, b_c)
             else:
-                result_data = _mops.accelerate_batched_matmul(a_data, b_data)
+                result_data = _mops.accelerate_batched_matmul_fast(a_data, b_data)
         else:
             result_data = np.matmul(a_data, b_data)
     elif _USE_CYTHON:
@@ -1601,7 +1620,12 @@ def cos(input: Tensor) -> Tensor:
 
 
 def atan2(y: Tensor, x: Tensor) -> Tensor:
-    result_data = np.arctan2(y._data, x._data)
+    y._ensure_cpu()
+    x._ensure_cpu()
+    if _USE_MPS:
+        result_data = _mops.accelerate_atan2(y._data, x._data)
+    else:
+        result_data = np.arctan2(y._data, x._data)
     rg = y._needs_grad(x)
     grad_fn = None
     if rg:

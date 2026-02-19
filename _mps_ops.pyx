@@ -106,6 +106,16 @@ cdef extern from "Accelerate/Accelerate.h" nogil:
     void vvtanh(double *result, const double *x, const int *n) nogil
     void vvrecf(float *result, const float *x, const int *n) nogil
 
+    # ── vecLib trig (float32 & float64) ──
+    void vvsinf(float *result, const float *x, const int *n) nogil
+    void vvcosf(float *result, const float *x, const int *n) nogil
+    void vvatan2f(float *result, const float *y, const float *x, const int *n) nogil
+    void vvsin(double *result, const double *x, const int *n) nogil
+    void vvcos(double *result, const double *x, const int *n) nogil
+
+    # ── vecLib reciprocal sqrt ──
+    void vvrsqrtf(float *result, const float *x, const int *n) nogil
+
     # ── vDSP vector arithmetic (float) ──
     void vDSP_vsadd(const float *A, int IA,
                     const float *B,
@@ -1485,3 +1495,248 @@ def accelerate_cumsum(np.ndarray x not None, int dim):
                 running = running + inp[i * L + j]
                 outp[i * L + j] = running
     return result.reshape(shape)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Trig functions: sin, cos, atan2  (via vecLib vvsinf/vvcosf/vvatan2f)
+# ──────────────────────────────────────────────────────────────────────
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray veclib_sinf(FLOAT32[::1] x):
+    """sin(x) via vecLib vvsinf."""
+    cdef int n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vvsinf(out, &x[0], &n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray veclib_cosf(FLOAT32[::1] x):
+    """cos(x) via vecLib vvcosf."""
+    cdef int n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vvcosf(out, &x[0], &n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray veclib_atan2f(FLOAT32[::1] y, FLOAT32[::1] x):
+    """atan2(y, x) via vecLib vvatan2f."""
+    cdef int n = y.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vvatan2f(out, &y[0], &x[0], &n)
+    return result
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+cpdef np.ndarray veclib_rsqrtf(FLOAT32[::1] x):
+    """rsqrt(x) via vecLib vvrsqrtf — fused 1/sqrt."""
+    cdef int n = x.shape[0]
+    cdef np.ndarray result = np.empty(n, dtype=np.float32)
+    cdef float *out = <float *>np.PyArray_DATA(result)
+    with nogil:
+        vvrsqrtf(out, &x[0], &n)
+    return result
+
+
+def accelerate_sin(np.ndarray x not None):
+    """sin via vecLib vvsinf (float32), else NumPy."""
+    cdef tuple shape = (<object>x).shape
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return (<object>veclib_sinf(flat)).reshape(shape)
+    return np.sin(x)
+
+
+def accelerate_cos(np.ndarray x not None):
+    """cos via vecLib vvcosf (float32), else NumPy."""
+    cdef tuple shape = (<object>x).shape
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return (<object>veclib_cosf(flat)).reshape(shape)
+    return np.cos(x)
+
+
+def accelerate_atan2(np.ndarray y not None, np.ndarray x not None):
+    """atan2 via vecLib vvatan2f (float32), else NumPy."""
+    cdef tuple shape = (<object>y).shape
+    if y.dtype == np.float32 and x.dtype == np.float32 and shape == (<object>x).shape:
+        flat_y = y.ravel() if y.flags.c_contiguous else np.ascontiguousarray(y).ravel()
+        flat_x = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return (<object>veclib_atan2f(flat_y, flat_x)).reshape(shape)
+    return np.arctan2(y, x)
+
+
+def accelerate_rsqrt_fused(np.ndarray x not None):
+    """rsqrt via vecLib vvrsqrtf (float32) — fused 1/sqrt, no intermediate."""
+    cdef tuple shape = (<object>x).shape
+    if x.dtype == np.float32:
+        flat = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        return (<object>veclib_rsqrtf(flat)).reshape(shape)
+    return 1.0 / np.sqrt(x)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Dropout — fast Cython mask generation + scale
+# ──────────────────────────────────────────────────────────────────────
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def accelerate_dropout(np.ndarray x not None, float p):
+    """Dropout: generate mask and apply in one pass.
+    Returns (result, scaled_mask).
+    Uses uint8 random bytes (4x less bandwidth) for mask generation.
+    """
+    cdef tuple shape = (<object>x).shape
+    cdef unsigned long n
+    cdef float scale = 1.0 / (1.0 - p)
+    cdef np.ndarray mask_f32, result, flat_x, mask_u8
+    cdef float *mp
+    cdef float *xp
+    cdef float *outp
+    cdef unsigned char *bp
+    cdef unsigned char thresh
+    cdef Py_ssize_t i
+
+    if x.dtype == np.float32:
+        flat_x = x.ravel() if x.flags.c_contiguous else np.ascontiguousarray(x).ravel()
+        n = <unsigned long>flat_x.shape[0]
+        # Use uint8 random — 4x less data to generate than float32
+        thresh = <unsigned char>(<float>255.0 * p)
+        mask_u8 = np.frombuffer(np.random.bytes(<Py_ssize_t>n), dtype=np.uint8)
+        result = np.empty(n, dtype=np.float32)
+        mask_f32 = np.empty(n, dtype=np.float32)
+
+        bp = <unsigned char *>np.PyArray_DATA(mask_u8)
+        xp = <float *>np.PyArray_DATA(flat_x)
+        outp = <float *>np.PyArray_DATA(result)
+        mp = <float *>np.PyArray_DATA(mask_f32)
+
+        # threshold + scale mask, then multiply with input — all nogil
+        with nogil:
+            for i in range(<Py_ssize_t>n):
+                if bp[i] > thresh:
+                    outp[i] = xp[i] * scale
+                    mp[i] = scale
+                else:
+                    outp[i] = 0.0
+                    mp[i] = 0.0
+        return result.reshape(shape), mask_f32.reshape(shape)
+
+    # fallback
+    mask = (np.random.rand(*shape) > p).astype(x.dtype)
+    return x * mask * scale, mask * scale
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Batched matmul — pure-C loop, no per-slice Python overhead
+# ──────────────────────────────────────────────────────────────────────
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def accelerate_batched_matmul_fast(np.ndarray a not None, np.ndarray b not None):
+    """Batched matmul using cblas_sgemm in a nogil C loop.
+    Avoids per-slice Python overhead of the original version.
+    a: (..., M, K), b: (..., K, N) -> (..., M, N)
+    """
+    if a.dtype != np.float32 or b.dtype != np.float32:
+        return np.matmul(a, b)
+    if a.ndim == 2 and b.ndim == 2:
+        return <object>blas_sgemm(np.ascontiguousarray(a), np.ascontiguousarray(b))
+    if a.ndim < 2 or b.ndim < 2:
+        return np.matmul(a, b)
+
+    cdef int a_nd = a.ndim
+    cdef int b_nd = b.ndim
+    cdef int M = a.shape[a_nd - 2]
+    cdef int K = a.shape[a_nd - 1]
+    cdef int N = b.shape[b_nd - 1]
+    cdef float alpha = 1.0
+    cdef float beta = 0.0
+
+    # Flatten batch dims
+    cdef tuple a_shape = (<object>a).shape
+    cdef tuple b_shape = (<object>b).shape
+    cdef np.ndarray batch_a = np.ascontiguousarray(a.reshape(-1, M, K))
+    cdef np.ndarray batch_b
+    if b.ndim == a.ndim:
+        batch_b = np.ascontiguousarray(b.reshape(-1, K, N))
+    else:
+        batch_b = np.ascontiguousarray(
+            np.broadcast_to(b, a_shape[:a_nd - 2] + b_shape[b_nd - 2:]).reshape(-1, K, N))
+
+    cdef int batch_size = batch_a.shape[0]
+    cdef int b_batch = batch_b.shape[0]
+    cdef np.ndarray result = np.empty((batch_size, M, N), dtype=np.float32)
+
+    cdef float *a_ptr = <float *>np.PyArray_DATA(batch_a)
+    cdef float *b_ptr = <float *>np.PyArray_DATA(batch_b)
+    cdef float *c_ptr = <float *>np.PyArray_DATA(result)
+    cdef int stride_a = M * K
+    cdef int stride_b = K * N
+    cdef int stride_c = M * N
+    cdef int bi
+    cdef Py_ssize_t i
+
+    with nogil:
+        for i in range(<Py_ssize_t>batch_size):
+            bi = <int>i if <int>i < b_batch else 0
+            cblas_sgemm(CblasRowMajor, CblasNoTrans, CblasNoTrans,
+                        M, N, K, alpha,
+                        &a_ptr[i * stride_a], K,
+                        &b_ptr[bi * stride_b], N,
+                        beta, &c_ptr[i * stride_c], N)
+
+    cdef tuple out_shape = a_shape[:a_nd - 1] + (N,)
+    return result.reshape(out_shape)
+
+
+# ──────────────────────────────────────────────────────────────────────
+#  Pad — fast constant padding for 3D tensors
+# ──────────────────────────────────────────────────────────────────────
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def accelerate_pad_3d(np.ndarray x not None, list np_pad, float value=0.0):
+    """Fast 3D constant pad: x is (B, S, D), np_pad is list of (lo,hi) tuples
+    per dimension. Uses memcpy for data rows."""
+    cdef int B = x.shape[0]
+    cdef int S = x.shape[1]
+    cdef int D = x.shape[2]
+    cdef int top = np_pad[1][0]
+    cdef int bottom = np_pad[1][1]
+    cdef int left = np_pad[2][0]
+    cdef int right = np_pad[2][1]
+    cdef int new_S = S + top + bottom
+    cdef int new_D = D + left + right
+    cdef np.ndarray result
+    cdef float *xp
+    cdef float *rp
+    cdef Py_ssize_t b, s
+
+    if x.dtype != np.float32:
+        return None  # fall back to numpy
+
+    x = np.ascontiguousarray(x)
+    result = np.full((B, new_S, new_D), value, dtype=np.float32)
+    xp = <float *>np.PyArray_DATA(x)
+    rp = <float *>np.PyArray_DATA(result)
+
+    with nogil:
+        for b in range(B):
+            for s in range(S):
+                memcpy(
+                    &rp[(b * new_S + (s + top)) * new_D + left],
+                    &xp[(b * S + s) * D],
+                    D * sizeof(float))
+    return result
