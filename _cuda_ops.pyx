@@ -1512,6 +1512,7 @@ def dev_cat(tensors, int dim=0):
     cdef CudaBuffer dst
     cdef int ret = 0
     cdef int dev
+    cdef int64_t o = 0
 
     for s in out_shape:
         total *= s
