@@ -5,13 +5,53 @@
 """Neural network layers — Linear, Embedding, Conv1d, Dropout, SiLU."""
 from __future__ import annotations
 
+import gc
 import math
 import numpy as np
 
 from ..tensor import Tensor, _USE_MPS, _USE_CYTHON, _USE_CUDA, _mops, _cops, _cuops, _is_cuda
 from .. import autograd as _ag
-from .module import Module
+from .module import Module, _release_host_memory
 from .parameter import Parameter
+
+
+def _param_to_device(p: Parameter, device) -> None:
+    """Upload a freshly-created parameter to *device* in-place and free CPU.
+
+    Called during layer __init__ when a target device is specified so
+    that the numpy weight array never persists in host RAM.
+    """
+    if device is None:
+        return
+    from ..device import device as Device
+    dev = Device(device) if isinstance(device, str) else device
+    if not _USE_CUDA or not _is_cuda(dev):
+        return
+    target_dev = dev._index if dev._index is not None else 0
+    if p._data is not None and p._data.dtype in (np.float32, np.int64):
+        p._gpu = _cuops.gputensor_from_numpy(
+            np.ascontiguousarray(p._data), target_dev)
+        p._data = None
+        p._device = dev
+
+
+# Module-level default device for parameter creation
+_default_param_device = None
+
+
+def set_default_device(device):
+    """Set the default device used for new parameters.
+
+    Usage::
+
+        sf.nn.set_default_device('cuda:0')
+        model = MyLargeModel()          # all weights go directly to GPU
+        sf.nn.set_default_device(None)  # reset
+
+    This avoids materialising the entire model in host RAM first.
+    """
+    global _default_param_device
+    _default_param_device = device
 
 
 # ──────────────────────── Linear ──────────────────────────────────────
@@ -20,18 +60,25 @@ class Linear(Module):
     """Applies a linear transformation: y = xW^T + b."""
 
     def __init__(self, in_features: int, out_features: int,
-                 bias: bool = True):
+                 bias: bool = True, device=None):
         super().__init__()
         self.in_features = in_features
         self.out_features = out_features
+        _dev = device or _default_param_device
         k = 1.0 / math.sqrt(in_features)
         w = np.random.uniform(-k, k, (out_features, in_features)).astype(np.float32)
         self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w                        # free source array immediately
         if bias:
             b = np.random.uniform(-k, k, (out_features,)).astype(np.float32)
             self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
         else:
             self.bias = None  # type: ignore[assignment]
+        if _dev is not None:
+            gc.collect(0)
 
     def forward(self, x: Tensor) -> Tensor:
         # GPU-resident fast path
@@ -109,12 +156,17 @@ class Linear(Module):
 class Embedding(Module):
     """A simple lookup table that stores embeddings of a fixed dictionary."""
 
-    def __init__(self, num_embeddings: int, embedding_dim: int):
+    def __init__(self, num_embeddings: int, embedding_dim: int, device=None):
         super().__init__()
         self.num_embeddings = num_embeddings
         self.embedding_dim = embedding_dim
+        _dev = device or _default_param_device
         w = np.random.randn(num_embeddings, embedding_dim).astype(np.float32) * 0.02
         self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
+        if _dev is not None:
+            gc.collect(0)
 
     def forward(self, indices: Tensor) -> Tensor:
         # GPU-resident fast path
@@ -164,13 +216,14 @@ class Conv1d(Module):
 
     def __init__(self, in_channels: int, out_channels: int,
                  kernel_size: int, padding: int = 0,
-                 groups: int = 1, bias: bool = True):
+                 groups: int = 1, bias: bool = True, device=None):
         super().__init__()
         self.in_channels = in_channels
         self.out_channels = out_channels
         self.kernel_size = kernel_size
         self.padding = padding
         self.groups = groups
+        _dev = device or _default_param_device
         assert in_channels % groups == 0
         assert out_channels % groups == 0
         k = 1.0 / math.sqrt(in_channels * kernel_size / groups)
@@ -179,9 +232,13 @@ class Conv1d(Module):
             (out_channels, in_channels // groups, kernel_size)
         ).astype(np.float32)
         self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
         if bias:
             b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
             self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
         else:
             self.bias = None  # type: ignore[assignment]
 
@@ -391,18 +448,21 @@ class LayerNorm(Module):
     """
 
     def __init__(self, normalized_shape, eps: float = 1e-5,
-                 elementwise_affine: bool = True):
+                 elementwise_affine: bool = True, device=None):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = tuple(normalized_shape)
         self.eps = eps
         self.elementwise_affine = elementwise_affine
+        _dev = device or _default_param_device
         if elementwise_affine:
             self.weight = Parameter(Tensor(np.ones(self.normalized_shape,
                                                   dtype=np.float32)))
             self.bias = Parameter(Tensor(np.zeros(self.normalized_shape,
                                                   dtype=np.float32)))
+            _param_to_device(self.weight, _dev)
+            _param_to_device(self.bias, _dev)
         else:
             self.weight = None
             self.bias = None
@@ -472,14 +532,16 @@ class RMSNorm(Module):
     Like LayerNorm but without re-centring (no bias subtraction).
     """
 
-    def __init__(self, normalized_shape, eps: float = 1e-6):
+    def __init__(self, normalized_shape, eps: float = 1e-6, device=None):
         super().__init__()
         if isinstance(normalized_shape, int):
             normalized_shape = (normalized_shape,)
         self.normalized_shape = tuple(normalized_shape)
         self.eps = eps
+        _dev = device or _default_param_device
         self.weight = Parameter(Tensor(np.ones(self.normalized_shape,
                                                dtype=np.float32)))
+        _param_to_device(self.weight, _dev)
 
     def forward(self, x: Tensor) -> Tensor:
         # CUDA fast-path (GPU-resident)

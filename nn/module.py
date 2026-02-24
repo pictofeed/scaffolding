@@ -5,12 +5,29 @@
 """nn.Module — base class for all neural network modules."""
 from __future__ import annotations
 
+import gc
+import sys
 import numpy as np
 from collections import OrderedDict
 from typing import Iterator
 
 from ..tensor import Tensor
 from .parameter import Parameter
+
+# Pre-load malloc_trim on Linux for releasing freed pages to the OS.
+_malloc_trim = None
+if sys.platform == 'linux':
+    try:
+        import ctypes as _ctypes
+        _malloc_trim = _ctypes.CDLL('libc.so.6').malloc_trim
+    except Exception:
+        pass
+
+def _release_host_memory():
+    """Full GC pass + malloc_trim to claw back host RSS."""
+    gc.collect()
+    if _malloc_trim is not None:
+        _malloc_trim(0)
 
 
 class Module:
@@ -142,11 +159,30 @@ class Module:
             if key in own_sd:
                 target = own_sd[key]
                 if isinstance(val, Tensor):
-                    target._data = val._ensure_cpu().copy()
-                    target._gpu = None
+                    # If the target parameter lives on GPU, upload the
+                    # incoming weight directly without keeping a CPU copy.
+                    if target._gpu is not None:
+                        arr = val._ensure_cpu()
+                        from ..tensor import _USE_CUDA, _cuops
+                        dev_id = (target._device._index
+                                  if target._device._index is not None else 0)
+                        target._gpu = _cuops.gputensor_from_numpy(
+                            np.ascontiguousarray(arr), dev_id)
+                        target._data = None
+                    else:
+                        target._data = val._ensure_cpu().copy()
+                        target._gpu = None
                 elif isinstance(val, np.ndarray):
-                    target._data = val.copy()
-                    target._gpu = None
+                    if target._gpu is not None:
+                        from ..tensor import _USE_CUDA, _cuops
+                        dev_id = (target._device._index
+                                  if target._device._index is not None else 0)
+                        target._gpu = _cuops.gputensor_from_numpy(
+                            np.ascontiguousarray(val), dev_id)
+                        target._data = None
+                    else:
+                        target._data = val.copy()
+                        target._gpu = None
 
     # ---- Training mode ----
 
@@ -170,12 +206,23 @@ class Module:
     # ---- Device / dtype ----
 
     def to(self, *args, **kwargs) -> 'Module':
+        # Stream parameters to device one-by-one so that the CPU copy
+        # of each weight can be freed before the next one is uploaded.
+        # This keeps peak host RSS ≈ size-of-largest-parameter instead
+        # of ≈ total-model-size, which is critical on RAM-limited
+        # machines with large GPU VRAM (e.g. 4 GB RAM + 12 GB K80).
         for name, p in self._parameters.items():
             new_p = Tensor.to(p, *args, **kwargs)
             # Update parameter in-place
             p._data = new_p._data
             p._gpu = new_p._gpu
             p._device = new_p._device
+            # Immediately drop the CPU shadow so RSS can shrink
+            if p._gpu is not None:
+                p._data = None
+            del new_p
+        # Release freed numpy arrays back to the OS
+        _release_host_memory()
         for name, buf in self._buffers.items():
             if buf is not None:
                 self._buffers[name] = buf.to(*args, **kwargs)

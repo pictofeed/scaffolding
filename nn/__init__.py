@@ -23,6 +23,7 @@ from .layers import (
     LayerNorm,
     RMSNorm,
     DataParallel,
+    set_default_device,
 )
 
 # Functional API (accessible as nn.functional or F)
@@ -43,5 +44,6 @@ __all__ = [
     'Linear', 'Embedding', 'Conv1d', 'Dropout',
     'SiLU', 'ReLU', 'GELU', 'LayerNorm', 'RMSNorm',
     'DataParallel', 'DistributedDataParallel',
+    'set_default_device',
     'functional', 'init', 'utils',
 ]

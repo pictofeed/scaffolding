@@ -1152,6 +1152,50 @@ class Tensor:
         if 'device' in kwargs:
             new_device = Device(kwargs['device'])
 
+        # --- Moving to CUDA: avoid creating unnecessary CPU copies ---
+        if _USE_CUDA and _is_cuda(new_device):
+            target_dev = new_device._index if new_device._index is not None else 0
+            # Already on the target GPU with matching dtype — nothing to do
+            if (self._gpu is not None and _is_cuda(self._device)
+                    and new_dtype is None):
+                src_dev = self._device._index if self._device._index is not None else 0
+                if src_dev == target_dev:
+                    return self
+                # Cross-GPU copy (device-to-device, no host staging)
+                t = Tensor.__new__(Tensor)
+                t._data = None
+                t._gpu = _cuops.gputensor_to_device(self._gpu, target_dev)
+                t._requires_grad = self._requires_grad
+                t._grad = None
+                t._grad_fn = None
+                t._device = new_device
+                t._version = 0
+                return t
+
+            # Need CPU data to upload — download if GPU-only
+            arr = self._data
+            if arr is None and self._gpu is not None:
+                arr = _cuops.gputensor_to_numpy(self._gpu)
+            elif arr is None:
+                arr = np.zeros((), dtype=np.float32)
+
+            if new_dtype is not None:
+                np_dt = new_dtype.to_numpy() if isinstance(new_dtype, Dtype) else new_dtype
+                arr = arr.astype(np_dt)
+
+            if arr.dtype in (np.float32, np.int64):
+                t = Tensor.__new__(Tensor)
+                t._gpu = _cuops.gputensor_from_numpy(
+                    np.ascontiguousarray(arr), target_dev)
+                t._data = None        # ← GPU is canonical; no CPU copy
+                t._requires_grad = self._requires_grad
+                t._grad = None
+                t._grad_fn = None
+                t._device = new_device
+                t._version = 0
+                return t
+
+        # --- Non-CUDA path (CPU / MPS) ---
         arr = self._ensure_cpu()
         if new_dtype is not None:
             if isinstance(new_dtype, Dtype):
@@ -1159,20 +1203,6 @@ class Tensor:
             else:
                 arr = arr.astype(new_dtype)
         t = Tensor._wrap(arr.copy(), self._requires_grad, None, new_device)
-        # Upload to GPU if moving to CUDA
-        if _USE_CUDA and _is_cuda(new_device) and t._data.dtype in (np.float32, np.int64):
-            target_dev = new_device._index if new_device._index is not None else 0
-            # Cross-GPU: if already on a different GPU, use device copy
-            if self._gpu is not None and _is_cuda(self._device):
-                src_dev = self._device._index if self._device._index is not None else 0
-                if src_dev != target_dev:
-                    t._gpu = _cuops.gputensor_to_device(self._gpu, target_dev)
-                else:
-                    t._gpu = self._gpu
-            else:
-                t._gpu = _cuops.gputensor_from_numpy(
-                    np.ascontiguousarray(t._data), target_dev)
-            t._data = None            # ← GPU is canonical; drop CPU copy
         return t
 
     def cpu(self) -> 'Tensor':
