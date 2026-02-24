@@ -116,8 +116,13 @@ class AdamW(Optimizer):
                 t = st['step']
                 m, v = st['m'], st['v']
                 grad = p._grad
-                # Ensure grad dtype matches param dtype
-                p_dtype = p._data.dtype if p._data is not None else np.float32
+                # Determine dtype from whichever storage is populated
+                if p._data is not None:
+                    p_dtype = p._data.dtype
+                elif p._gpu is not None:
+                    p_dtype = p._gpu.dtype
+                else:
+                    p_dtype = np.float32
                 if grad.dtype != p_dtype:
                     grad = grad.astype(p_dtype)
 
@@ -134,23 +139,23 @@ class AdamW(Optimizer):
                         if 'gpu_m' not in st:
                             st['gpu_m'] = _gpu_from_numpy(np.ascontiguousarray(m))
                             st['gpu_v'] = _gpu_from_numpy(np.ascontiguousarray(v))
-                        # Ensure grad is on GPU
-                        if isinstance(grad, np.ndarray):
-                            gpu_grad = _gpu_from_numpy(np.ascontiguousarray(grad))
-                        else:
-                            gpu_grad = _gpu_from_numpy(np.ascontiguousarray(grad))
+                        # Upload grad to GPU (temporary — freed after kernel)
+                        gpu_grad = _gpu_from_numpy(
+                            grad if grad.flags.c_contiguous else np.ascontiguousarray(grad))
                         _dev_adamw(p._gpu, gpu_grad, st['gpu_m'], st['gpu_v'],
                                    lr, beta1, beta2, eps, wd, bc1, bc2)
+                        del gpu_grad              # ← free GPU grad immediately
                     else:
                         # Fused CUDA AdamW kernel — single pass (CPU arrays)
                         p._ensure_cpu()
                         _cuda_adamw(p._data, grad, m, v,
                                     lr, beta1, beta2, eps, wd, bc1, bc2)
-                elif _USE_MPS_ADAM and p._data.dtype == np.float32:
+                elif _USE_MPS_ADAM and (p._ensure_cpu() is not None) and p._data.dtype == np.float32:
                     # Use Accelerate vDSP vectorized AdamW (fastest)
                     _accel_adamw(p._data, grad, m, v,
                                 lr, beta1, beta2, eps, wd, bc1, bc2)
-                elif (_USE_CYTHON_ADAM and p._data.dtype == np.float32
+                elif (_USE_CYTHON_ADAM and (p._ensure_cpu() is not None)
+                        and p._data.dtype == np.float32
                         and p._data.ndim <= 2):
                     # Use Cython nogil kernel
                     flat_p = np.ascontiguousarray(p._data, dtype=np.float32).ravel()
@@ -165,6 +170,7 @@ class AdamW(Optimizer):
                     st['v'] = flat_v.reshape(v.shape)
                 else:
                     # Pure Python path — fused for fewer temporaries
+                    p._ensure_cpu()
                     # Decoupled weight decay (in-place)
                     if wd != 0:
                         p._data *= (1.0 - lr * wd)

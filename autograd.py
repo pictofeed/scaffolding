@@ -10,6 +10,17 @@ traverses it in topological order during :meth:`Tensor.backward`.
 from __future__ import annotations
 
 import gc
+import sys
+
+# Pre-load glibc malloc_trim on Linux so we can call it cheaply in
+# backward() to return freed pages to the OS.
+_malloc_trim = None
+if sys.platform == 'linux':
+    try:
+        import ctypes as _ctypes
+        _malloc_trim = _ctypes.CDLL("libc.so.6").malloc_trim
+    except Exception:
+        pass
 import numpy as np
 from typing import TYPE_CHECKING, Sequence
 
@@ -168,7 +179,7 @@ def backward(root: 'Tensor', grad: np.ndarray | None = None) -> None:
                 if ig is None:
                     continue
                 # Reduce broadcast dims
-                inp_shape = inp._data.shape
+                inp_shape = inp.shape     # use property (handles _data=None)
                 if ig.shape != inp_shape:
                     ig = _unbroadcast(ig, inp_shape)
                 if inp._grad is not None:
@@ -196,9 +207,18 @@ def backward(root: 'Tensor', grad: np.ndarray | None = None) -> None:
         # retain_graph=False behaviour.
         t._grad_fn = None
 
-    # Force a generation-0 GC pass to reclaim cyclic references
-    # between Tensor and GradFn objects immediately.
-    gc.collect(0)
+    # Release the topo-sort list so all intermediate Tensor references
+    # are dropped before the GC pass.
+    del order
+
+    # Full GC pass (all generations) to reclaim cyclic Tensor↔GradFn
+    # references that may have been promoted beyond generation 0.
+    gc.collect()
+
+    # On Linux, nudge glibc to return freed pages to the OS so
+    # that RSS actually decreases and the OOM killer stays away.
+    if _malloc_trim is not None:
+        _malloc_trim(0)
 
 
 def _unbroadcast(grad: np.ndarray, shape: tuple) -> np.ndarray:

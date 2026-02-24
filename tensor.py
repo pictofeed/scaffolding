@@ -102,6 +102,7 @@ class Tensor:
         if _USE_CUDA and _is_cuda(self._device) and arr.dtype in (np.float32, np.int64):
             target_dev = self._device._index if self._device._index is not None else 0
             self._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), target_dev)
+            self._data = None         # ← GPU is canonical; drop CPU copy
 
     # ------------------------------------------------------------------ #
     #  Properties                                                        #
@@ -296,9 +297,18 @@ class Tensor:
         return t
 
     def _ensure_cpu(self):
-        """Ensure _data is populated (download from GPU if needed)."""
+        """Ensure _data is populated (download from GPU if needed).
+
+        For leaf tensors that require gradients (i.e. model parameters),
+        the GPU copy is kept alive to avoid expensive re-uploads every
+        forward pass.  For all other tensors the GPU copy is released
+        so that device memory is freed as soon as the CPU data exists.
+        """
         if self._data is None and self._gpu is not None:
             self._data = _cuops.gputensor_to_numpy(self._gpu)
+            # Keep GPU copy for parameters (avoids re-upload bouncing)
+            if not self._requires_grad:
+                self._gpu = None      # ← free GPU memory immediately
         return self._data
 
     def _needs_grad(self, *others: 'Tensor') -> bool:
@@ -993,6 +1003,7 @@ class Tensor:
         if _USE_CUDA and _is_cuda(self._device) and t._data.dtype == np.float32:
             _dev = self._device._index if self._device._index is not None else 0
             t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data), _dev)
+            t._data = None            # ← GPU is canonical; drop CPU copy
         return t
 
     def permute(self, *dims) -> 'Tensor':
@@ -1161,6 +1172,7 @@ class Tensor:
             else:
                 t._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(t._data), target_dev)
+            t._data = None            # ← GPU is canonical; drop CPU copy
         return t
 
     def cpu(self) -> 'Tensor':
@@ -1317,6 +1329,7 @@ def _make_tensor(arr: np.ndarray, requires_grad: bool, device: Device) -> Tensor
     if _USE_CUDA and _is_cuda(device) and arr.dtype in (np.float32, np.int64):
         _dev = device._index if device._index is not None else 0
         t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), _dev)
+        t._data = None                # ← GPU is canonical; drop CPU copy
     return t
 
 

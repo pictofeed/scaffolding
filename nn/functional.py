@@ -301,12 +301,28 @@ def scaled_dot_product_attention(
         dropout_p: float = 0.0,
         scale: float | None = None) -> Tensor:
     """Scaled dot-product attention (manual)."""
+    d = q.shape[-1]
+    if scale is None:
+        scale = 1.0 / math.sqrt(d)
+
+    # GPU-resident fast path — keeps Q, K, V on device so downstream
+    # layers stay on the GPU path and never create host numpy copies.
+    if (_USE_CUDA and _is_cuda(q._device)
+            and q._gpu is not None and k._gpu is not None
+            and v._gpu is not None and attn_mask is None):
+        # scores = Q @ K^T  (batched, ...,S,HD) × (...,S,HD)^T → (...,S,S)
+        scores_gpu = _cuops.dev_batched_matmul_nt(q._gpu, k._gpu)
+        scores_gpu = _cuops.dev_muls(scores_gpu, float(scale))
+        attn_weights_gpu = _cuops.dev_softmax(scores_gpu, -1)
+        if dropout_p > 0.0:
+            attn_weights_gpu, _ = _cuops.dev_dropout(attn_weights_gpu, dropout_p)
+        # output = attn_weights @ V  (...,S,S) × (...,S,HD) → (...,S,HD)
+        out_gpu = _cuops.dev_batched_matmul(attn_weights_gpu, v._gpu)
+        return Tensor._wrap_gpu(out_gpu, device=q._device)
+
     q._ensure_cpu()
     k._ensure_cpu()
     v._ensure_cpu()
-    d = q._data.shape[-1]
-    if scale is None:
-        scale = 1.0 / math.sqrt(d)
     # Fused scores computation
     k_T = np.swapaxes(k._data, -2, -1)
     if _USE_MPS and q._data.dtype == np.float32 and q._data.ndim >= 2:

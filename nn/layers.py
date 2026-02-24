@@ -39,7 +39,8 @@ class Linear(Module):
             # Determine target device from input tensor
             _target_dev = x._device._index if x._device._index is not None else 0
             # Ensure weight is on the same GPU as input
-            if self.weight._gpu is None and self.weight._data is not None:
+            if self.weight._gpu is None:
+                self.weight._ensure_cpu()
                 self.weight._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(self.weight._data), _target_dev)
             elif self.weight._gpu is not None and self.weight._gpu.device_id != _target_dev:
@@ -48,7 +49,8 @@ class Linear(Module):
                 gt_bias = None
                 has_bias = self.bias is not None and isinstance(self.bias, Parameter)
                 if has_bias:
-                    if self.bias._gpu is None and self.bias._data is not None:
+                    if self.bias._gpu is None:
+                        self.bias._ensure_cpu()
                         self.bias._gpu = _cuops.gputensor_from_numpy(
                             np.ascontiguousarray(self.bias._data), _target_dev)
                     elif self.bias._gpu is not None and self.bias._gpu.device_id != _target_dev:
@@ -61,21 +63,23 @@ class Linear(Module):
                     device=x._device)
 
         # Use BLAS sgemm_nt to avoid transposing weight
+        # Ensure weight (and bias) CPU data is available — it may be GPU-only
+        self.weight._ensure_cpu()
         w_data = self.weight._data
+        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+        if has_bias:
+            self.bias._ensure_cpu()
         if _USE_CUDA and _is_cuda(x._device):
-            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
             result_data = _cuops.cuda_linear_forward(
                 x._ensure_cpu() if x._data is None else x._data, w_data,
                 self.bias._data if has_bias else None
             )
         elif _USE_MPS and x._data.dtype == np.float32 and w_data.dtype == np.float32:
             result_data = _mops.accelerate_linear_forward(x._data, w_data)
-            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
             if has_bias:
                 result_data = result_data + self.bias._data
         else:
             result_data = x._data @ w_data.T
-            has_bias = self.bias is not None and isinstance(self.bias, Parameter)
             if has_bias:
                 result_data = result_data + self.bias._data
 
@@ -116,7 +120,8 @@ class Embedding(Module):
         # GPU-resident fast path
         if _USE_CUDA and _is_cuda(indices._device) and indices._gpu is not None:
             _target_dev = indices._device._index if indices._device._index is not None else 0
-            if self.weight._gpu is None and self.weight._data is not None:
+            if self.weight._gpu is None:
+                self.weight._ensure_cpu()
                 self.weight._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(self.weight._data), _target_dev)
             elif self.weight._gpu is not None and self.weight._gpu.device_id != _target_dev:
@@ -131,6 +136,7 @@ class Embedding(Module):
         idx = indices._ensure_cpu() if indices._data is None else indices._data
         if idx.dtype != np.intp:
             idx = idx.astype(np.intp)
+        self.weight._ensure_cpu()          # weight may be GPU-only
         if _USE_CUDA and _is_cuda(indices._device):
             result_data = _cuops.cuda_embedding(self.weight._data, idx.astype(np.int64))
         else:
@@ -185,6 +191,7 @@ class Conv1d(Module):
         Uses vectorized im2col approach instead of Python loops.
         """
         x._ensure_cpu()
+        self.weight._ensure_cpu()          # weight may be GPU-only
         B, C_in, L = x._data.shape
         K = self.kernel_size
         P = self.padding
@@ -243,6 +250,7 @@ class Conv1d(Module):
 
         has_bias = self.bias is not None and isinstance(self.bias, Parameter)
         if has_bias:
+            self.bias._ensure_cpu()        # bias may be GPU-only
             out += self.bias._data[np.newaxis, :, np.newaxis]
 
         rg = (x._requires_grad or self.weight._requires_grad) and _ag.is_grad_enabled()
@@ -404,9 +412,11 @@ class LayerNorm(Module):
         if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
             _target_dev = x._device._index if x._device._index is not None else 0
             if self.weight is not None and self.weight._gpu is None:
+                self.weight._ensure_cpu()
                 self.weight._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(self.weight._data), _target_dev)
             if self.bias is not None and self.bias._gpu is None:
+                self.bias._ensure_cpu()
                 self.bias._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(self.bias._data), _target_dev)
             # Reshape to 2D for kernel
@@ -424,6 +434,10 @@ class LayerNorm(Module):
 
         # CUDA fallback (CPU arrays)
         if _USE_CUDA and _is_cuda(x._device):
+            if self.weight is not None:
+                self.weight._ensure_cpu()
+            if self.bias is not None:
+                self.bias._ensure_cpu()
             gamma = self.weight._data if self.weight is not None else None
             beta = self.bias._data if self.bias is not None else None
             xd = x._ensure_cpu() if x._data is None else x._data
@@ -441,6 +455,8 @@ class LayerNorm(Module):
         var = np.var(x._data, axis=axes, keepdims=True)
         x_norm = (x._data - mean) / np.sqrt(var + self.eps)
         if self.elementwise_affine:
+            self.weight._ensure_cpu()
+            self.bias._ensure_cpu()
             x_norm = x_norm * self.weight._data + self.bias._data
         return Tensor._wrap(x_norm.astype(np.float32),
                             x._requires_grad, None, x._device)
@@ -470,6 +486,7 @@ class RMSNorm(Module):
         if _USE_CUDA and _is_cuda(x._device) and x._gpu is not None:
             _target_dev = x._device._index if x._device._index is not None else 0
             if self.weight._gpu is None:
+                self.weight._ensure_cpu()
                 self.weight._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(self.weight._data), _target_dev)
             orig_shape = x._gpu.shape
@@ -483,6 +500,7 @@ class RMSNorm(Module):
 
         # CUDA fallback
         if _USE_CUDA and _is_cuda(x._device):
+            self.weight._ensure_cpu()
             gamma = self.weight._data
             xd = x._ensure_cpu() if x._data is None else x._data
             y = _cuops.cuda_rms_norm(
@@ -494,6 +512,7 @@ class RMSNorm(Module):
 
         # Generic NumPy path
         x._ensure_cpu()
+        self.weight._ensure_cpu()
         axes = tuple(range(-len(self.normalized_shape), 0))
         rms = np.sqrt(np.mean(x._data ** 2, axis=axes, keepdims=True) + self.eps)
         x_norm = x._data / rms * self.weight._data
