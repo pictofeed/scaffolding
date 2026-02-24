@@ -1585,6 +1585,7 @@ def dev_chunk(gt, int chunks, int dim=0):
     cdef CudaBuffer src = <CudaBuffer>(gt.buffer)
     cdef CudaBuffer chunk_dst
     cdef int ret2 = 0
+    cdef int64_t o = 0
 
     sizes = []
     for i in range(chunks):
