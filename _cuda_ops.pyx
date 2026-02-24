@@ -1437,6 +1437,7 @@ def dev_expand(gt, new_shape):
     cdef CudaBuffer src
     cdef int ret0 = 0
     cdef int ret1 = 0
+    cdef int64_t r = 0
 
     for s in new_shape:
         total *= s
