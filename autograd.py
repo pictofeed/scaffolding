@@ -9,6 +9,7 @@ traverses it in topological order during :meth:`Tensor.backward`.
 """
 from __future__ import annotations
 
+import gc
 import numpy as np
 from typing import TYPE_CHECKING, Sequence
 
@@ -139,6 +140,7 @@ def _topo_sort(root: 'Tensor') -> list['Tensor']:
 def backward(root: 'Tensor', grad: np.ndarray | None = None) -> None:
     """Run backward pass from *root* tensor."""
     if grad is None:
+        root._ensure_cpu()
         if root._data.size == 1:
             grad = np.ones_like(root._data)
         else:
@@ -179,15 +181,24 @@ def backward(root: 'Tensor', grad: np.ndarray | None = None) -> None:
                     np.add(prev, ig, out=prev)
                 else:
                     inp._grad_out = ig if ig.flags.owndata else ig.copy()
-            # Free saved tensors early to reduce memory pressure
+            # Free saved tensors and inputs early to reduce memory pressure
             gfn.saved = None
+            gfn.inputs = []
 
-    # Cleanup
+    # Cleanup: detach the computation graph so all intermediate tensors
+    # and GradFn nodes can be garbage-collected.
     for t in order:
         try:
             del t._grad_out
         except AttributeError:
             pass
+        # Detach the graph — equivalent to PyTorch's default
+        # retain_graph=False behaviour.
+        t._grad_fn = None
+
+    # Force a generation-0 GC pass to reclaim cyclic references
+    # between Tensor and GradFn objects immediately.
+    gc.collect(0)
 
 
 def _unbroadcast(grad: np.ndarray, shape: tuple) -> np.ndarray:

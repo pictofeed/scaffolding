@@ -363,7 +363,13 @@ class GELU(Module):
             x._ensure_cpu()
             result_data = 0.5 * x._data * (1 + np.tanh(
                 math.sqrt(2.0 / math.pi) * (x._data + 0.044715 * x._data ** 3)))
-        return Tensor._wrap(result_data, x._requires_grad, None, x._device)
+        rg = x._requires_grad and _ag.is_grad_enabled()
+        grad_fn = None
+        if rg:
+            grad_fn = _ag.GeluBackward()
+            grad_fn.inputs = [x]
+            grad_fn.saved = {'x': x._data}
+        return Tensor._wrap(result_data, rg, grad_fn, x._device)
 
 
 # ──────────────────────── DataParallel stub ───────────────────────────
