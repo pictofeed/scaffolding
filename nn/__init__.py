@@ -38,6 +38,14 @@ from .parallel import DistributedDataParallel
 # Utils (nn.utils.clip_grad_norm_)
 from . import utils
 
+# Auto-select CUDA as the default parameter device when available
+try:
+    from ..tensor import _USE_CUDA
+    if _USE_CUDA:
+        set_default_device('cuda:0')
+except Exception:
+    pass
+
 __all__ = [
     'Module', 'ModuleList', 'Sequential',
     'Parameter',
