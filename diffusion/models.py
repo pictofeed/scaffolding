@@ -1,13 +1,3 @@
-class AutoencoderKL(Module):
-    # ...existing code...
-
-    def enable_slicing(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
-
-    def enable_tiling(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
@@ -40,6 +30,17 @@ from ..nn.layers import (
     _param_to_device, _default_param_device,
 )
 
+
+class AutoencoderKL(Module):
+    # ...existing code...
+
+    def enable_slicing(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
+
+    def enable_tiling(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
 
 def _valid_groups(channels: int, max_groups: int = 32) -> int:
     for g in range(min(max_groups, channels), 0, -1):
