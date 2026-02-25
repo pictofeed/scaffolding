@@ -65,13 +65,13 @@ from .autograd import (
 )
 
 # ── Sub-packages ──
+
 from . import nn
 from . import optim
 from . import distributed
 from . import backends
 from . import cuda
 from . import utils
-from . import diffusion
 
 __all__ = [
     "__version__",
@@ -96,3 +96,6 @@ __all__ = [
     # Sub-packages
     'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils', 'diffusion',
 ]
+
+# Import diffusion last to avoid circular import issues
+from . import diffusion
