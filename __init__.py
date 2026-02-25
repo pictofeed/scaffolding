@@ -94,7 +94,8 @@ __all__ = [
     # Utility
     'manual_seed', 'save', 'load', 'compile', 'set_float32_matmul_precision',
     # Sub-packages
-    'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils', 'diffusion',
+    'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils',
 ]
 
-# Do not import diffusion here to avoid circular import issues. Users should import scaffolding.diffusion directly.
+# Note: 'diffusion' is a submodule and should be imported as 'scaffolding.diffusion'.
+# It is not included in __all__ to avoid circular import issues.
