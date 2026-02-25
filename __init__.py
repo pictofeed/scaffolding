@@ -40,6 +40,7 @@ from .tensor import (
     bernoulli,
     manual_seed, save, load, compile,
     set_float32_matmul_precision,
+    Generator,
 )
 
 # ── Dtype constants ──
@@ -94,6 +95,7 @@ __all__ = [
     'no_grad', 'inference_mode', 'is_grad_enabled', 'set_grad_enabled',
     # Utility
     'manual_seed', 'save', 'load', 'compile', 'set_float32_matmul_precision',
+    'Generator',
     # Sub-packages
     'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils', 'diffusion',
 ]

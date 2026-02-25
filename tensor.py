@@ -1761,6 +1761,45 @@ def manual_seed(seed: int) -> None:
     np.random.seed(seed)
 
 
+class Generator:
+    """Random number generator state (mirrors ``torch.Generator``).
+
+    Usage::
+
+        g = Generator().manual_seed(42)
+        # pass *g* to functions / pipelines that accept a ``generator`` arg
+    """
+
+    def __init__(self, device: str = 'cpu'):
+        self._rng = np.random.default_rng()
+        self._seed: int | None = None
+
+    def manual_seed(self, seed: int) -> 'Generator':
+        """Seed this generator and return *self* for chaining."""
+        self._seed = seed
+        self._rng = np.random.default_rng(seed)
+        return self
+
+    def seed(self) -> int:
+        """Return the initial seed (or generate one)."""
+        if self._seed is None:
+            self._seed = int(np.random.randint(0, 2**63))
+        return self._seed
+
+    def get_state(self) -> dict:
+        return self._rng.bit_generator.state
+
+    def set_state(self, state: dict) -> None:
+        self._rng.bit_generator.state = state
+
+    def randn(self, *shape: int, dtype=np.float32) -> np.ndarray:
+        """Generate standard-normal samples."""
+        return self._rng.standard_normal(shape).astype(dtype)
+
+    def randint(self, low: int, high: int, size: tuple) -> np.ndarray:
+        return self._rng.integers(low, high, size=size)
+
+
 def save(obj, path: str) -> None:
     import pickle
     with open(path, 'wb') as f:

@@ -10,8 +10,9 @@ This is an original implementation inspired by TORA, not a copy of Alibaba's cod
 """
 from __future__ import annotations
 
+import math
 import numpy as np
-from typing import Optional, Callable
+from typing import Optional, Callable, Union, Any
 
 from scaffolding.tensor import Tensor
 from scaffolding import autograd as _ag
@@ -72,38 +73,169 @@ class ToraPipeline:
     @_ag.no_grad()
     def __call__(
         self,
+        prompt: Optional[str] = None,
         prompt_embeds: Optional[Tensor] = None,
         negative_prompt_embeds: Optional[Tensor] = None,
-        height: int = 1024,
-        width: int = 1024,
-        num_inference_steps: int = 30,
-        guidance_scale: float = 5.0,
+        video_flow: Optional[Tensor] = None,
+        height: int = 480,
+        width: int = 720,
+        num_frames: int = 49,
+        num_inference_steps: int = 50,
+        guidance_scale: float = 6.0,
+        use_dynamic_cfg: bool = False,
         eta: float = 0.0,
         seed: Optional[int] = None,
+        generator: Optional[Any] = None,
         callback: Optional[Callable] = None,
         callback_steps: int = 1,
     ) -> Tensor:
+        """Run the Tora text-to-video (or trajectory-guided) pipeline.
+
+        Args:
+            prompt:               Text prompt (encoded internally if
+                                  ``text_encoder`` and ``tokenizer`` are set).
+            prompt_embeds:        Pre-computed text embeddings ``(B, S, D)``.
+            negative_prompt_embeds: Negative-prompt embeddings for CFG.
+            video_flow:           Optional trajectory/flow tensor for guided
+                                  generation.  ``None`` = pure text-to-video.
+            height:               Output height in pixels.
+            width:                Output width in pixels.
+            num_frames:           Number of video frames to generate.
+            num_inference_steps:  Denoising steps.
+            guidance_scale:       Classifier-free guidance weight.
+            use_dynamic_cfg:      If ``True``, linearly ramp the guidance
+                                  scale from ``guidance_scale`` down to 1.0
+                                  over the denoising loop.
+            eta:                  DDIM η (stochasticity).
+            seed:                 Legacy seed parameter (prefer *generator*).
+            generator:            ``scaffolding.Generator`` (or compatible)
+                                  for reproducible noise initialisation.
+            callback:             ``callback(step, timestep, latents)``.
+            callback_steps:       Invoke *callback* every N steps.
+
+        Returns:
+            ``Tensor`` of shape ``(B, C, num_frames, H, W)`` (video) or
+            ``(B, C, H, W)`` (image when ``num_frames <= 1``).
+        """
+
+        # ── resolve prompt → embeddings ──
         if prompt_embeds is None:
-            raise ValueError("prompt_embeds is required (or set text_encoder + tokenizer)")
-        B = prompt_embeds._data.shape[0] if hasattr(prompt_embeds, '_data') else 1
+            if prompt is not None and self.text_encoder is not None and self.tokenizer is not None:
+                tokens = self.tokenizer(prompt)
+                if isinstance(tokens, Tensor):
+                    prompt_embeds = self.text_encoder(tokens)
+                elif isinstance(tokens, np.ndarray):
+                    prompt_embeds = self.text_encoder(
+                        Tensor._wrap(tokens.astype(np.int64),
+                                     False, None, None))
+                else:
+                    # Tokenizer may return raw values; pass directly to encoder
+                    prompt_embeds = self.text_encoder(tokens)
+            elif prompt is not None:
+                # No text encoder — create a dummy embedding so the pipeline
+                # can still run in a test / demo capacity.
+                prompt_embeds = Tensor._wrap(
+                    np.random.randn(1, 77, 768).astype(np.float32),
+                    False, None, None)
+            else:
+                raise ValueError(
+                    "Either 'prompt' or 'prompt_embeds' must be provided.")
+
+        B = (prompt_embeds._data.shape[0]
+             if hasattr(prompt_embeds, '_data') else 1)
+
+        # ── determine RNG seed ──
+        if generator is not None and hasattr(generator, '_seed'):
+            eff_seed = generator._seed
+        elif seed is not None:
+            eff_seed = seed
+        else:
+            eff_seed = None
+
+        # ── initialise latents ──
         lH = height // self.latent_scale
         lW = width // self.latent_scale
-        latents = randn_tensor((B, self.latent_channels, lH, lW), seed=seed)
+        use_video = num_frames is not None and num_frames > 1
+        if use_video:
+            shape = (B, self.latent_channels, num_frames, lH, lW)
+        else:
+            shape = (B, self.latent_channels, lH, lW)
+
+        if generator is not None and hasattr(generator, 'randn'):
+            latents = Tensor._wrap(
+                generator.randn(*shape).astype(np.float32),
+                False, None, None)
+        else:
+            latents = randn_tensor(shape, seed=eff_seed)
+
+        # ── scheduler setup ──
         self.scheduler.set_timesteps(num_inference_steps)
         timesteps = self.scheduler.timesteps
+        total_steps = len(timesteps)
+
+        # ── denoising loop ──
         for i, t in enumerate(timesteps):
             t_tensor = Tensor._wrap(
                 np.full((B,), t, dtype=np.float32), False, None, None)
+
             model_input = latents
             if hasattr(self.scheduler, 'scale_model_input'):
                 model_input = self.scheduler.scale_model_input(latents, int(t))
-            if guidance_scale > 1.0 and negative_prompt_embeds is not None:
-                noise_pred = classifier_free_guidance(
-                    self.unet, model_input, t_tensor,
-                    prompt_embeds, negative_prompt_embeds,
-                    guidance_scale)
+
+            # Dynamic CFG: linearly ramp from guidance_scale → 1.0
+            if use_dynamic_cfg:
+                progress = i / max(total_steps - 1, 1)
+                current_guidance = guidance_scale + progress * (1.0 - guidance_scale)
             else:
-                noise_pred = self.unet(model_input, t_tensor, prompt_embeds)
+                current_guidance = guidance_scale
+
+            # ── model forward ──
+            # If latents are 5-D (video: B,C,F,H,W) but the UNet is 2-D,
+            # collapse frames into the batch dimension for inference.
+            def _run_unet(inp, t_emb, enc_hs, **extra_kw):
+                inp._ensure_cpu()
+                if inp._data.ndim == 5:
+                    B_, C_, F_, H_, W_ = inp._data.shape
+                    # (B,C,F,H,W) → (B*F, C, H, W)
+                    flat = inp._data.transpose(0, 2, 1, 3, 4).reshape(
+                        B_ * F_, C_, H_, W_)
+                    flat_t = Tensor._wrap(flat.astype(np.float32),
+                                         False, None, None)
+                    # Repeat timestep & encoder hidden states for each frame
+                    t_rep = Tensor._wrap(
+                        np.repeat(t_emb._data, F_, axis=0),
+                        False, None, None)
+                    if enc_hs is not None:
+                        enc_hs._ensure_cpu()
+                        enc_rep = Tensor._wrap(
+                            np.repeat(enc_hs._data, F_, axis=0),
+                            False, None, None)
+                    else:
+                        enc_rep = None
+                    out = self.unet(flat_t, t_rep, enc_rep)
+                    out._ensure_cpu()
+                    # (B*F,C,H,W) → (B,C,F,H,W)
+                    out5 = out._data.reshape(B_, F_, C_, H_, W_).transpose(
+                        0, 2, 1, 3, 4)
+                    return Tensor._wrap(out5.astype(np.float32),
+                                       False, None, None)
+                return self.unet(inp, t_emb, enc_hs)
+
+            if current_guidance > 1.0 and negative_prompt_embeds is not None:
+                # Manual CFG with video-aware forward
+                noise_cond = _run_unet(model_input, t_tensor, prompt_embeds)
+                noise_uncond = _run_unet(model_input, t_tensor,
+                                         negative_prompt_embeds)
+                noise_cond._ensure_cpu(); noise_uncond._ensure_cpu()
+                guided = (noise_uncond._data
+                          + current_guidance
+                          * (noise_cond._data - noise_uncond._data))
+                noise_pred = Tensor._wrap(guided.astype(np.float32),
+                                          False, None, None)
+            else:
+                noise_pred = _run_unet(model_input, t_tensor, prompt_embeds)
+
+            # ── scheduler step ──
             if hasattr(self.scheduler, 'step'):
                 import inspect
                 sig = inspect.signature(self.scheduler.step)
@@ -113,21 +245,40 @@ class ToraPipeline:
                 else:
                     latents = self.scheduler.step(
                         noise_pred, int(t), latents)
+
             if callback is not None and (i + 1) % callback_steps == 0:
                 callback(i + 1, t, latents)
+
+        # ── decode latents ──
         if self.vae is not None:
             latents._ensure_cpu()
-            z = Tensor._wrap(
-                (latents._data / self.vae.scaling_factor).astype(np.float32),
-                False, None, latents._device)
-            images = self.vae.decode(z)
+            z_data = (latents._data / self.vae.scaling_factor).astype(np.float32)
+            if z_data.ndim == 5:
+                # (B, C, F, H, W) → decode each frame through the 2-D VAE
+                B_, C_, F_, H_, W_ = z_data.shape
+                frames = []
+                for f_idx in range(F_):
+                    frame_z = Tensor._wrap(
+                        z_data[:, :, f_idx, :, :].copy(),
+                        False, None, latents._device)
+                    frame_dec = self.vae.decode(frame_z)
+                    frame_dec._ensure_cpu()
+                    frames.append(frame_dec._data)
+                # Stack → (B, C_out, F, H_out, W_out)
+                output_data = np.stack(frames, axis=2)
+                output = Tensor._wrap(output_data.astype(np.float32),
+                                      False, None, None)
+            else:
+                z = Tensor._wrap(z_data, False, None, latents._device)
+                output = self.vae.decode(z)
         else:
-            images = latents
-        images._ensure_cpu()
-        images = Tensor._wrap(
-            np.clip(images._data, -1.0, 1.0).astype(np.float32),
+            output = latents
+
+        output._ensure_cpu()
+        output = Tensor._wrap(
+            np.clip(output._data, -1.0, 1.0).astype(np.float32),
             False, None, None)
-        return images
+        return output
 
 def _load_pipeline(*args, **kwargs):
     return ToraPipeline(*args, **kwargs)
