@@ -99,6 +99,15 @@ def device_count() -> int:
     return _dc()
 
 
+def total_memory_all_devices() -> int:
+    """Combined VRAM across all CUDA devices (bytes).
+
+    On a K80, sums both GK210 dies (~24 GB).
+    """
+    from ..cuda import total_memory_all_devices as _tma
+    return _tma()
+
+
 __all__ = [
     'matmul', 'is_built',
     'enable_flash_sdp', 'flash_sdp_enabled',

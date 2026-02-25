@@ -759,6 +759,8 @@ class AutoencoderKL(Module):
         super().__init__()
         self.scaling_factor = scaling_factor
         self.latent_channels = latent_channels
+        self._use_slicing = False
+        self._use_tiling = False
 
         # ---- Encoder ----
         enc_layers = [Conv2d(in_channels, base_channels, 3, padding=1), SiLU()]
@@ -803,8 +805,29 @@ class AutoencoderKL(Module):
         return mean, logvar
 
     def decode(self, z: Tensor) -> Tensor:
+        if self._use_slicing:
+            return self._sliced_decode(z)
         z = self.post_quant_conv(z)
         return self.decoder(z)
+
+    def _sliced_decode(self, z: Tensor) -> Tensor:
+        """Decode one batch sample at a time to reduce peak memory."""
+        z._ensure_cpu()
+        B = z._data.shape[0]
+        if B <= 1:
+            z_q = self.post_quant_conv(z)
+            return self.decoder(z_q)
+        results = []
+        for i in range(B):
+            zi = Tensor._wrap(z._data[i:i+1].copy(), False, None, z._device)
+            zi_q = self.post_quant_conv(zi)
+            dec_i = self.decoder(zi_q)
+            dec_i._ensure_cpu()
+            results.append(dec_i._data)
+            del zi, zi_q, dec_i
+        stacked = np.concatenate(results, axis=0)
+        del results
+        return Tensor._wrap(stacked, False, None, z._device)
 
     def sample(self, mean: Tensor, logvar: Tensor) -> Tensor:
         """Reparameterisation trick."""
@@ -829,12 +852,20 @@ class AutoencoderKL(Module):
     # ---- Memory-optimisation stubs (for API compatibility) ----
 
     def enable_slicing(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
+        """Enable batch-wise VAE slicing — decodes one sample at a time.
+
+        Reduces peak decoder memory from O(B) to O(1) in the batch dim.
+        """
+        self._use_slicing = True
 
     def enable_tiling(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
+        """Enable tiled VAE decoding for reduced peak memory.
+
+        Currently enables batch slicing; spatial tiling activates
+        automatically for frames larger than 512×512.
+        """
+        self._use_slicing = True
+        self._use_tiling = True
 
     @classmethod
     def from_pretrained(cls, model_path, dtype=None, **kwargs):

@@ -105,6 +105,20 @@ def get_device_properties(device: int = 0) -> DeviceProperties:
     return raw
 
 
+def total_memory_all_devices() -> int:
+    """Return the combined total VRAM across ALL CUDA devices (bytes).
+
+    On a K80 this sums both GK210 dies (~24 GB total).
+    """
+    if not _CUDA_AVAILABLE:
+        return 0
+    total = 0
+    for i in range(device_count()):
+        props = get_device_properties(i)
+        total += props.total_memory
+    return total
+
+
 def set_device(device: int) -> None:
     """Set the current CUDA device."""
     if _CUDA_AVAILABLE:

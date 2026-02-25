@@ -77,6 +77,10 @@ class ToraPipeline:
         Calls ``.to()`` on each sub-module (unet, vae, text_encoder)
         that supports it.  Returns *self* for chaining.
         """
+        if device is not None:
+            self._device_str = device if isinstance(device, str) else str(device)
+        if dtype is not None:
+            self._dtype = dtype
         for attr_name in ('unet', 'vae', 'text_encoder'):
             comp = getattr(self, attr_name, None)
             if comp is not None and hasattr(comp, 'to'):
@@ -105,6 +109,8 @@ class ToraPipeline:
         self.tokenizer = tokenizer
         self.latent_channels = latent_channels
         self.latent_scale = latent_scale
+        self._device_str = 'cpu'
+        self._dtype = None  # None = float32; set via .to()
 
     @_ag.no_grad()
     def __call__(
@@ -180,6 +186,12 @@ class ToraPipeline:
         B = (prompt_embeds._data.shape[0]
              if hasattr(prompt_embeds, '_data') else 1)
 
+        # ── compute dtype (float16 halves all intermediate memory) ──
+        _np_dtype = np.float32
+        if self._dtype is not None:
+            _np_dtype = (self._dtype.to_numpy()
+                         if hasattr(self._dtype, 'to_numpy') else np.float16)
+
         # ── determine RNG seed ──
         if generator is not None and hasattr(generator, '_seed'):
             eff_seed = generator._seed
@@ -199,10 +211,13 @@ class ToraPipeline:
 
         if generator is not None and hasattr(generator, 'randn'):
             latents = Tensor._wrap(
-                generator.randn(*shape).astype(np.float32),
+                generator.randn(*shape).astype(_np_dtype),
                 False, None, None)
         else:
             latents = randn_tensor(shape, seed=eff_seed)
+            latents._ensure_cpu()
+            latents = Tensor._wrap(latents._data.astype(_np_dtype),
+                                   False, None, None)
 
         # ── scheduler setup ──
         self.scheduler.set_timesteps(num_inference_steps)
@@ -235,26 +250,31 @@ class ToraPipeline:
                     # (B,C,F,H,W) → (B*F, C, H, W)
                     flat = inp._data.transpose(0, 2, 1, 3, 4).reshape(
                         B_ * F_, C_, H_, W_)
-                    flat_t = Tensor._wrap(flat.astype(np.float32),
+                    flat_t = Tensor._wrap(flat.astype(_np_dtype),
                                          False, None, None)
+                    del flat  # free intermediate immediately
                     # Repeat timestep & encoder hidden states for each frame
                     t_rep = Tensor._wrap(
-                        np.repeat(t_emb._data, F_, axis=0),
+                        np.repeat(t_emb._data, F_, axis=0).astype(_np_dtype),
                         False, None, None)
                     if enc_hs is not None:
                         enc_hs._ensure_cpu()
                         enc_rep = Tensor._wrap(
-                            np.repeat(enc_hs._data, F_, axis=0),
+                            np.repeat(enc_hs._data, F_, axis=0).astype(_np_dtype),
                             False, None, None)
                     else:
                         enc_rep = None
                     out = self.unet(flat_t, t_rep, enc_rep)
+                    del flat_t, t_rep, enc_rep  # free inputs post-forward
                     out._ensure_cpu()
                     # (B*F,C,H,W) → (B,C,F,H,W)
                     out5 = out._data.reshape(B_, F_, C_, H_, W_).transpose(
                         0, 2, 1, 3, 4)
-                    return Tensor._wrap(out5.astype(np.float32),
-                                       False, None, None)
+                    del out  # free flat output
+                    result = Tensor._wrap(out5.astype(_np_dtype),
+                                          False, None, None)
+                    del out5
+                    return result
                 return self.unet(inp, t_emb, enc_hs)
 
             if current_guidance > 1.0 and negative_prompt_embeds is not None:
@@ -263,11 +283,15 @@ class ToraPipeline:
                 noise_uncond = _run_unet(model_input, t_tensor,
                                          negative_prompt_embeds)
                 noise_cond._ensure_cpu(); noise_uncond._ensure_cpu()
-                guided = (noise_uncond._data
-                          + current_guidance
-                          * (noise_cond._data - noise_uncond._data))
-                noise_pred = Tensor._wrap(guided.astype(np.float32),
+                # Memory-efficient CFG: reuse arrays, free early
+                guided = noise_cond._data - noise_uncond._data  # 1 alloc
+                del noise_cond  # free cond
+                guided *= current_guidance                       # in-place
+                guided += noise_uncond._data                     # in-place
+                del noise_uncond  # free uncond
+                noise_pred = Tensor._wrap(guided.astype(_np_dtype),
                                           False, None, None)
+                del guided
             else:
                 noise_pred = _run_unet(model_input, t_tensor, prompt_embeds)
 
@@ -285,37 +309,49 @@ class ToraPipeline:
             if callback is not None and (i + 1) % callback_steps == 0:
                 callback(i + 1, t, latents)
 
-        # ── decode latents ──
+        # ── decode latents → PipelineOutput (memory-efficient) ──
+        # Instead of accumulating all decoded frames then converting,
+        # stream each frame through the VAE and directly to PIL.
+        # Peak memory: ONE decoded frame, not the full video.
+        from PIL import Image
+
         if self.vae is not None:
             latents._ensure_cpu()
-            z_data = (latents._data / self.vae.scaling_factor).astype(np.float32)
+            z_data = (latents._data / self.vae.scaling_factor).astype(_np_dtype)
+            del latents  # free latents immediately
+
             if z_data.ndim == 5:
-                # (B, C, F, H, W) → decode each frame through the 2-D VAE
+                # (B, C, F, H, W) — per-frame VAE decode → PIL
                 B_, C_, F_, H_, W_ = z_data.shape
-                frames = []
+                all_batches: list[list[Image.Image]] = [[] for _ in range(B_)]
                 for f_idx in range(F_):
                     frame_z = Tensor._wrap(
-                        z_data[:, :, f_idx, :, :].copy(),
-                        False, None, latents._device)
+                        z_data[:, :, f_idx, :, :].copy().astype(_np_dtype),
+                        False, None, None)
                     frame_dec = self.vae.decode(frame_z)
+                    del frame_z
                     frame_dec._ensure_cpu()
-                    frames.append(frame_dec._data)
-                # Stack → (B, C_out, F, H_out, W_out)
-                output_data = np.stack(frames, axis=2)
-                output = Tensor._wrap(output_data.astype(np.float32),
-                                      False, None, None)
+                    # Clip → rescale → uint8 without extra full-size copies
+                    fd = np.clip(frame_dec._data, -1.0, 1.0)
+                    del frame_dec
+                    fd = ((fd + 1.0) * 127.5).astype(np.uint8)
+                    for b in range(B_):
+                        img = fd[b].transpose(1, 2, 0)  # (C,H,W) → (H,W,C)
+                        if img.shape[-1] == 1:
+                            img = img.squeeze(-1)
+                        all_batches[b].append(Image.fromarray(img))
+                    del fd
+                del z_data
+                return PipelineOutput(frames=all_batches)
             else:
-                z = Tensor._wrap(z_data, False, None, latents._device)
+                z = Tensor._wrap(z_data, False, None, None)
+                del z_data
                 output = self.vae.decode(z)
+                del z
         else:
             output = latents
 
-        output._ensure_cpu()
-        output = Tensor._wrap(
-            np.clip(output._data, -1.0, 1.0).astype(np.float32),
-            False, None, None)
-
-        # ── convert to PipelineOutput with PIL frames ──
+        # Fallback for non-video or no-VAE path
         return self._tensor_to_pipeline_output(output)
 
     @staticmethod
