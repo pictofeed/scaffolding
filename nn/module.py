@@ -242,6 +242,26 @@ class Module:
     def cpu(self) -> 'Module':
         return self.to('cpu')
 
+    def _release_cpu_shadows(self) -> None:
+        """Drop CPU copies of parameters that are backed by GPU memory.
+
+        During a forward pass, ``_ensure_cpu()`` downloads every accessed
+        parameter to CPU while keeping the GPU copy alive (because
+        ``_requires_grad=True``).  On a RAM-limited host this can double
+        peak RSS because *every* parameter ends up resident on both
+        CPU and GPU simultaneously.
+
+        Call this after a forward pass completes to free those CPU
+        shadows — the GPU copy remains canonical and will be re-
+        downloaded on the next forward pass.  The cost is one extra
+        device→host copy per step, but it prevents the OOM-killer
+        from terminating the process on machines with ≤ 2.5 GB RAM.
+        """
+        for p in self.parameters():
+            if p._gpu is not None and p._data is not None:
+                p._data = None       # drop CPU shadow; GPU copy stays
+        _release_host_memory()
+
     # ---- Gradient management ----
 
     def zero_grad(self, set_to_none: bool = False):

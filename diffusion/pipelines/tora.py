@@ -21,6 +21,13 @@ from scaffolding.diffusion.schedulers import DDIMScheduler
 from scaffolding.diffusion.models import UNet2DConditionModel, AutoencoderKL
 from scaffolding.diffusion.utils import classifier_free_guidance, randn_tensor
 
+# Maximum number of video frames to feed through the UNet in a single
+# forward pass.  Processing all 49 frames at once creates ~300-500 MB
+# of intermediate numpy activations on CPU; chunking to 4 keeps peak
+# CPU RAM around 30-60 MB per mini-batch, preventing OOM on hosts
+# with ≤ 2.5 GB system RAM.
+_UNET_FRAME_BATCH = 4
+
 
 # ── Pipeline output wrapper ──
 
@@ -249,39 +256,58 @@ class ToraPipeline:
             # ── model forward ──
             # If latents are 5-D (video: B,C,F,H,W) but the UNet is 2-D,
             # collapse frames into the batch dimension for inference.
+            #
+            # MEMORY-CRITICAL: process frames in mini-batches of
+            # _UNET_FRAME_BATCH to keep peak CPU RAM low.  After each
+            # mini-batch, CPU shadows of model parameters are released
+            # so the OS can reclaim the memory immediately.
             def _run_unet(inp, t_emb, enc_hs, **extra_kw):
                 inp._ensure_cpu()
                 if inp._data.ndim == 5:
                     B_, C_, F_, H_, W_ = inp._data.shape
-                    # (B,C,F,H,W) → (B*F, C, H, W)
-                    flat = inp._data.transpose(0, 2, 1, 3, 4).reshape(
-                        B_ * F_, C_, H_, W_)
-                    flat_t = Tensor._wrap(flat.astype(_np_dtype),
-                                         False, None, None)
-                    del flat  # free intermediate immediately
-                    # Repeat timestep & encoder hidden states for each frame
-                    t_rep = Tensor._wrap(
-                        np.repeat(t_emb._data, F_, axis=0).astype(_np_dtype),
-                        False, None, None)
-                    if enc_hs is not None:
-                        enc_hs._ensure_cpu()
-                        enc_rep = Tensor._wrap(
-                            np.repeat(enc_hs._data, F_, axis=0).astype(_np_dtype),
+                    out_chunks: list = []
+                    for fr_start in range(0, F_, _UNET_FRAME_BATCH):
+                        fr_end = min(fr_start + _UNET_FRAME_BATCH, F_)
+                        chunk_f = fr_end - fr_start
+                        # (B, C, chunk_f, H, W) → (B*chunk_f, C, H, W)
+                        chunk = inp._data[:, :, fr_start:fr_end, :, :]
+                        flat = chunk.transpose(0, 2, 1, 3, 4).reshape(
+                            B_ * chunk_f, C_, H_, W_)
+                        flat_t = Tensor._wrap(flat.astype(_np_dtype),
+                                             False, None, None)
+                        del flat, chunk
+                        t_rep = Tensor._wrap(
+                            np.repeat(t_emb._data, chunk_f, axis=0).astype(_np_dtype),
                             False, None, None)
-                    else:
-                        enc_rep = None
-                    out = self.unet(flat_t, t_rep, enc_rep)
-                    del flat_t, t_rep, enc_rep  # free inputs post-forward
-                    out._ensure_cpu()
-                    # (B*F,C,H,W) → (B,C,F,H,W)
-                    out5 = out._data.reshape(B_, F_, C_, H_, W_).transpose(
-                        0, 2, 1, 3, 4)
-                    del out  # free flat output
-                    result = Tensor._wrap(out5.astype(_np_dtype),
-                                          False, None, None)
-                    del out5
+                        if enc_hs is not None:
+                            enc_hs._ensure_cpu()
+                            enc_rep = Tensor._wrap(
+                                np.repeat(enc_hs._data, chunk_f, axis=0).astype(_np_dtype),
+                                False, None, None)
+                        else:
+                            enc_rep = None
+                        out = self.unet(flat_t, t_rep, enc_rep)
+                        del flat_t, t_rep, enc_rep
+                        out._ensure_cpu()
+                        # (B*chunk_f, C, H, W) → (B, chunk_f, C, H, W)
+                        out_chunks.append(
+                            out._data.reshape(B_, chunk_f, C_, H_, W_))
+                        del out
+                        # Free CPU shadows of model weights — the GPU
+                        # copies remain; they'll be re-downloaded on the
+                        # next mini-batch.  This prevents the OOM killer.
+                        self.unet._release_cpu_shadows()
+                    # Reassemble: (B, F, C, H, W) → (B, C, F, H, W)
+                    full = np.concatenate(out_chunks, axis=1)
+                    del out_chunks
+                    result = Tensor._wrap(
+                        full.transpose(0, 2, 1, 3, 4).astype(_np_dtype),
+                        False, None, None)
+                    del full
                     return result
-                return self.unet(inp, t_emb, enc_hs)
+                out = self.unet(inp, t_emb, enc_hs)
+                self.unet._release_cpu_shadows()
+                return out
 
             if current_guidance > 1.0 and negative_prompt_embeds is not None:
                 # Manual CFG with video-aware forward
@@ -316,9 +342,15 @@ class ToraPipeline:
                 callback(i + 1, t, latents)
 
         # ── decode latents → PipelineOutput (memory-efficient) ──
-        # Instead of accumulating all decoded frames then converting,
-        # stream each frame through the VAE and directly to output.
-        # Peak memory: ONE decoded frame, not the full video.
+        # Stream one frame at a time through the VAE so peak CPU RAM
+        # is ONE decoded frame (~1-3 MB), not the full video.
+        #
+        # IMPORTANT: we never materialise the full scaled-latent tensor
+        # (z_data) on CPU.  Instead we extract one frame's latents,
+        # scale, decode, convert to output format, and immediately free
+        # the CPU intermediates.  After each VAE decode, CPU shadows of
+        # VAE parameters are released to avoid keeping both CPU+GPU
+        # copies of the weights alive.
         #
         # output_type controls the format:
         #   "pil"       → PIL Images on CPU (legacy, higher CPU RAM)
@@ -332,19 +364,23 @@ class ToraPipeline:
 
         if self.vae is not None:
             latents._ensure_cpu()
-            z_data = (latents._data / self.vae.scaling_factor).astype(_np_dtype)
-            del latents  # free latents immediately
+            scaling = self.vae.scaling_factor
 
-            if z_data.ndim == 5:
-                # (B, C, F, H, W) — per-frame VAE decode
-                B_, C_, F_, H_, W_ = z_data.shape
+            if latents._data.ndim == 5:
+                # (B, C, F, H, W) — stream one frame at a time
+                B_, C_, F_, H_, W_ = latents._data.shape
                 all_batches: list = [[] for _ in range(B_)]
                 for f_idx in range(F_):
+                    # Extract single frame, scale, free slice immediately
+                    frame_slice = latents._data[:, :, f_idx, :, :]
                     frame_z = Tensor._wrap(
-                        z_data[:, :, f_idx, :, :].copy().astype(_np_dtype),
+                        (frame_slice / scaling).astype(_np_dtype).copy(),
                         False, None, None)
+                    del frame_slice
                     frame_dec = self.vae.decode(frame_z)
                     del frame_z
+                    # Release VAE CPU shadows after each frame decode
+                    self.vae._release_cpu_shadows()
                     frame_dec._ensure_cpu()
                     # Clip → rescale → uint8 without extra full-size copies
                     fd = np.clip(frame_dec._data, -1.0, 1.0)
@@ -363,13 +399,16 @@ class ToraPipeline:
                             from PIL import Image
                             all_batches[b].append(Image.fromarray(img_data))
                     del fd
-                del z_data
+                del latents
                 return PipelineOutput(frames=all_batches)
             else:
+                z_data = (latents._data / scaling).astype(_np_dtype)
+                del latents
                 z = Tensor._wrap(z_data, False, None, None)
                 del z_data
                 output = self.vae.decode(z)
                 del z
+                self.vae._release_cpu_shadows()
         else:
             output = latents
 
