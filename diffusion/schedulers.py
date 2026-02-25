@@ -228,6 +228,11 @@ class DDIMScheduler:
         set_alpha_to_one:    Forces ᾱ₀ = 1 for the boundary condition.
     """
 
+    @classmethod
+    def from_pretrained(cls, model_path, **kwargs):
+        """Construct a DDIMScheduler (ignores *model_path* — uses defaults)."""
+        return cls(**kwargs)
+
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -239,8 +244,12 @@ class DDIMScheduler:
         set_alpha_to_one: bool = True,
     ):
         self.num_train_timesteps = num_train_timesteps
+        self._beta_start = beta_start
+        self._beta_end = beta_end
+        self._beta_schedule = beta_schedule
         self.prediction_type = prediction_type
         self.clip_sample = clip_sample
+        self._set_alpha_to_one = set_alpha_to_one
 
         betas = _get_betas(beta_schedule, num_train_timesteps,
                            beta_start, beta_end)
@@ -251,6 +260,25 @@ class DDIMScheduler:
 
         self.timesteps = np.arange(num_train_timesteps - 1, -1, -1).astype(np.int64)
         self.num_inference_steps: int | None = None
+
+    @property
+    def config(self) -> dict:
+        """Return the scheduler configuration as a dict (mirrors HF Diffusers API)."""
+        return {
+            'num_train_timesteps': self.num_train_timesteps,
+            'beta_start': self._beta_start,
+            'beta_end': self._beta_end,
+            'beta_schedule': self._beta_schedule,
+            'clip_sample': self.clip_sample,
+            'prediction_type': self.prediction_type,
+            'set_alpha_to_one': self._set_alpha_to_one,
+        }
+
+    @classmethod
+    def from_config(cls, config: dict, **kwargs):
+        """Create a scheduler from a config dict, with optional overrides."""
+        merged = {**config, **kwargs}
+        return cls(**merged)
 
     def set_timesteps(self, num_inference_steps: int):
         self.num_inference_steps = num_inference_steps
@@ -540,6 +568,23 @@ class CogVideoXDPMScheduler:
         rescale_betas_zero_snr: Zero-terminal SNR re-scaling.
     """
 
+    @classmethod
+    def from_config(cls, config: dict, **kwargs):
+        """Create a scheduler from a config dict, with optional overrides.
+
+        Args:
+            config: Dictionary of scheduler parameters (e.g. from ``scheduler.config``).
+            **kwargs: Override any parameter in *config*.
+
+        Returns:
+            A new ``CogVideoXDPMScheduler`` instance.
+        """
+        import inspect
+        merged = {**config, **kwargs}
+        valid_params = inspect.signature(cls.__init__).parameters
+        filtered = {k: v for k, v in merged.items() if k in valid_params}
+        return cls(**filtered)
+
     def __init__(
         self,
         num_train_timesteps: int = 1000,
@@ -557,6 +602,9 @@ class CogVideoXDPMScheduler:
         rescale_betas_zero_snr: bool = False,
     ):
         self.num_train_timesteps = num_train_timesteps
+        self._beta_start = beta_start
+        self._beta_end = beta_end
+        self._beta_schedule = beta_schedule
         self.snr_shift_scale = snr_shift_scale
         self.prediction_type = prediction_type
         self.solver_order = solver_order
@@ -758,6 +806,25 @@ class CogVideoXDPMScheduler:
     def init_noise_sigma(self) -> float:
         """Initial noise standard deviation (for latent initialisation)."""
         return float(self.sigma_t[-1]) if len(self.sigma_t) > 0 else 1.0
+
+    @property
+    def config(self) -> dict:
+        """Return the scheduler configuration as a dict (mirrors HF Diffusers API)."""
+        return {
+            'num_train_timesteps': self.num_train_timesteps,
+            'beta_start': self._beta_start,
+            'beta_end': self._beta_end,
+            'beta_schedule': self._beta_schedule,
+            'snr_shift_scale': self.snr_shift_scale,
+            'prediction_type': self.prediction_type,
+            'solver_order': self.solver_order,
+            'timestep_spacing': self.timestep_spacing,
+            'clip_sample': self.clip_sample,
+            'clip_sample_range': self.clip_sample_range,
+            'use_dynamic_thresholding': self.use_dynamic_thresholding,
+            'dynamic_thresholding_ratio': self.dynamic_thresholding_ratio,
+            'rescale_betas_zero_snr': self.rescale_betas_zero_snr,
+        }
 
     def scale_model_input(self, sample: Tensor,
                           timestep: int) -> Tensor:

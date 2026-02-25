@@ -32,17 +32,6 @@ from scaffolding.nn.layers import (
 )
 
 
-class AutoencoderKL(Module):
-    # ...existing code...
-
-    def enable_slicing(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
-
-    def enable_tiling(self):
-        """No-op for compatibility with memory optimization APIs."""
-        pass
-
 def _valid_groups(channels: int, max_groups: int = 32) -> int:
     for g in range(min(max_groups, channels), 0, -1):
         if channels % g == 0:
@@ -293,6 +282,11 @@ class UNet2DConditionModel(Module):
         num_heads:      Multi-head attention heads.
         dropout:        Dropout rate.
     """
+
+    @classmethod
+    def from_pretrained(cls, model_path, dtype=None, **kwargs):
+        """Construct a UNet2DConditionModel (ignores *model_path* — weights are random)."""
+        return cls(**kwargs)
 
     def __init__(
         self,
@@ -831,6 +825,21 @@ class AutoencoderKL(Module):
             (z._data * self.scaling_factor).astype(np.float32),
             False, None, z._device)
         return self.decode(z_scaled), mean, logvar
+
+    # ---- Memory-optimisation stubs (for API compatibility) ----
+
+    def enable_slicing(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
+
+    def enable_tiling(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
+
+    @classmethod
+    def from_pretrained(cls, model_path, dtype=None, **kwargs):
+        """Construct an AutoencoderKL (ignores *model_path* — weights are random)."""
+        return cls(**kwargs)
 
 
 # ═════════════════════════════════════════════════════════════════════
