@@ -21,7 +21,7 @@ import math
 import numpy as np
 from typing import Optional, Union, List
 
-from ..tensor import Tensor
+from scaffolding.tensor import Tensor
 
 
 # ═════════════════════════════════════════════════════════════════════
