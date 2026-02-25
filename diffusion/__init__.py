@@ -56,7 +56,7 @@ from .pipelines import (
     CogVideoXPipeline,
 )
 # ── TORA Pipeline ──
-from .tora import ToraPipeline, _load_pipeline
+from .pipelines.tora import ToraPipeline, _load_pipeline
 
 # ── Utilities ──
 from .utils import (
