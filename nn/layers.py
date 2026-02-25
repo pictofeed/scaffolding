@@ -2,7 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
-"""Neural network layers — Linear, Embedding, Conv1d, Dropout, SiLU."""
+"""Neural network layers — Linear, Embedding, Conv1d/2d/3d, Dropout, SiLU, and more."""
 from __future__ import annotations
 
 import gc
@@ -583,6 +583,965 @@ class RMSNorm(Module):
 
     def extra_repr(self) -> str:
         return f'{self.normalized_shape}, eps={self.eps}'
+
+
+# ──────────────────────── Conv2d ───────────────────────────────────────
+
+class Conv2d(Module):
+    """2D convolution over spatial data (images).
+
+    Input:  (B, C_in, H, W)
+    Output: (B, C_out, H_out, W_out)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, dilation=1, groups=1,
+                 bias=True, device=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+        self.groups = groups
+        _dev = device or _default_param_device
+
+        assert in_channels % groups == 0
+        assert out_channels % groups == 0
+
+        kH, kW = self.kernel_size
+        k = 1.0 / math.sqrt(in_channels * kH * kW / groups)
+        w = np.random.uniform(-k, k,
+            (out_channels, in_channels // groups, kH, kW)).astype(np.float32)
+        self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
+
+        if bias:
+            b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
+            self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        """x: (B, C_in, H, W) → (B, C_out, H_out, W_out) via im2col."""
+        x._ensure_cpu()
+        self.weight._ensure_cpu()
+
+        B, C_in, H, W = x._data.shape
+        kH, kW = self.kernel_size
+        sH, sW = self.stride
+        pH, pW = self.padding
+        dH, dW = self.dilation
+
+        H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+        W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+
+        # Pad input
+        if pH > 0 or pW > 0:
+            x_padded = np.pad(x._data,
+                              ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+                              mode='constant')
+        else:
+            x_padded = x._data
+
+        # im2col using stride tricks
+        col = _im2col_2d(x_padded, kH, kW, sH, sW, dH, dW, H_out, W_out)
+
+        if self.groups == 1:
+            w_2d = self.weight._data.reshape(self.out_channels, -1)
+            out = np.einsum('oi,biN->boN', w_2d, col)
+            out = out.reshape(B, self.out_channels, H_out, W_out)
+        elif self.groups == C_in and self.groups == self.out_channels:
+            # Depthwise convolution
+            col_dw = col.reshape(B, C_in, kH * kW, H_out * W_out)
+            w = self.weight._data.reshape(self.out_channels, kH * kW, 1)
+            out = np.sum(col_dw * w[np.newaxis, :, :, :].reshape(1, self.out_channels, kH * kW, 1),
+                         axis=2)
+            out = out.reshape(B, self.out_channels, H_out, W_out)
+        else:
+            c_in_per_group = C_in // self.groups
+            c_out_per_group = self.out_channels // self.groups
+            out = np.zeros((B, self.out_channels, H_out * W_out), dtype=np.float32)
+            for grp in range(self.groups):
+                ci_s = grp * c_in_per_group
+                co_s = grp * c_out_per_group
+                col_grp = col[:, ci_s * kH * kW:(ci_s + c_in_per_group) * kH * kW, :]
+                w_grp = self.weight._data[co_s:co_s + c_out_per_group].reshape(c_out_per_group, -1)
+                out[:, co_s:co_s + c_out_per_group, :] = np.einsum('oi,biN->boN', w_grp, col_grp)
+            out = out.reshape(B, self.out_channels, H_out, W_out)
+
+        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+        if has_bias:
+            self.bias._ensure_cpu()
+            out += self.bias._data[np.newaxis, :, np.newaxis, np.newaxis]
+
+        rg = (x._requires_grad or self.weight._requires_grad) and _ag.is_grad_enabled()
+        grad_fn = None
+        if rg:
+            grad_fn = _ag.Conv2dBackward()
+            inputs = [x, self.weight]
+            if has_bias:
+                inputs.append(self.bias)
+            grad_fn.inputs = inputs
+            grad_fn.saved = {
+                'input': x._data, 'weight': self.weight._data,
+                'padding': self.padding, 'stride': self.stride,
+                'dilation': self.dilation, 'groups': self.groups,
+                'has_bias': has_bias,
+            }
+        return Tensor._wrap(out, rg, grad_fn, x._device)
+
+
+def _im2col_2d(x_padded, kH, kW, sH, sW, dH, dW, H_out, W_out):
+    """Extract image patches into columns for 2D convolution.
+
+    x_padded: (B, C_in, H_padded, W_padded)
+    Returns: (B, C_in*kH*kW, H_out*W_out)
+    """
+    B, C_in, Hp, Wp = x_padded.shape
+    # Build column indices
+    col = np.zeros((B, C_in * kH * kW, H_out * W_out), dtype=x_padded.dtype)
+
+    for i in range(kH):
+        for j in range(kW):
+            h_start = i * dH
+            w_start = j * dW
+            patch = x_padded[:, :,
+                             h_start:h_start + sH * H_out:sH,
+                             w_start:w_start + sW * W_out:sW]
+            col[:, (i * kW + j) * C_in:(i * kW + j + 1) * C_in, :] = \
+                patch.reshape(B, C_in, H_out * W_out)
+
+    # Reorder to group by channel: (B, C_in * kH * kW, N)
+    # The current layout is (B, kH*kW*C_in, N), re-transpose so
+    # channels are grouped: col[:, c*kH*kW + i*kW + j]
+    col2 = np.zeros_like(col)
+    for c in range(C_in):
+        for i in range(kH):
+            for j in range(kW):
+                src_idx = (i * kW + j) * C_in + c
+                dst_idx = c * kH * kW + i * kW + j
+                col2[:, dst_idx, :] = col[:, src_idx, :]
+    return col2
+
+
+# ──────────────────────── Conv3d ───────────────────────────────────────
+
+class Conv3d(Module):
+    """3D convolution over volumetric/temporal data.
+
+    Input:  (B, C_in, D, H, W)
+    Output: (B, C_out, D_out, H_out, W_out)
+
+    Essential for video processing where D is the temporal dimension.
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, dilation=1, groups=1,
+                 bias=True, device=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding, padding)
+        self.dilation = dilation if isinstance(dilation, tuple) else (dilation, dilation, dilation)
+        self.groups = groups
+        _dev = device or _default_param_device
+
+        assert in_channels % groups == 0
+        assert out_channels % groups == 0
+
+        kD, kH, kW = self.kernel_size
+        k = 1.0 / math.sqrt(in_channels * kD * kH * kW / groups)
+        w = np.random.uniform(-k, k,
+            (out_channels, in_channels // groups, kD, kH, kW)).astype(np.float32)
+        self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
+
+        if bias:
+            b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
+            self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        """x: (B, C_in, D, H, W) → (B, C_out, D_out, H_out, W_out)."""
+        x._ensure_cpu()
+        self.weight._ensure_cpu()
+
+        B, C_in, D, H, W = x._data.shape
+        kD, kH, kW = self.kernel_size
+        sD, sH, sW = self.stride
+        pD, pH, pW = self.padding
+        dD, dH, dW = self.dilation
+
+        D_out = (D + 2 * pD - dD * (kD - 1) - 1) // sD + 1
+        H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+        W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+
+        # Pad input
+        if pD > 0 or pH > 0 or pW > 0:
+            x_padded = np.pad(x._data,
+                              ((0, 0), (0, 0), (pD, pD), (pH, pH), (pW, pW)),
+                              mode='constant')
+        else:
+            x_padded = x._data
+
+        # im2col for 3D
+        col = _im2col_3d(x_padded, kD, kH, kW, sD, sH, sW,
+                         dD, dH, dW, D_out, H_out, W_out)
+
+        if self.groups == 1:
+            w_2d = self.weight._data.reshape(self.out_channels, -1)
+            out = np.einsum('oi,biN->boN', w_2d, col)
+            out = out.reshape(B, self.out_channels, D_out, H_out, W_out)
+        else:
+            c_in_per_group = C_in // self.groups
+            c_out_per_group = self.out_channels // self.groups
+            N = D_out * H_out * W_out
+            out = np.zeros((B, self.out_channels, N), dtype=np.float32)
+            for grp in range(self.groups):
+                ci_s = grp * c_in_per_group
+                co_s = grp * c_out_per_group
+                k_size = c_in_per_group * kD * kH * kW
+                col_grp = col[:, ci_s * kD * kH * kW:ci_s * kD * kH * kW + k_size, :]
+                w_grp = self.weight._data[co_s:co_s + c_out_per_group].reshape(c_out_per_group, -1)
+                out[:, co_s:co_s + c_out_per_group, :] = np.einsum('oi,biN->boN', w_grp, col_grp)
+            out = out.reshape(B, self.out_channels, D_out, H_out, W_out)
+
+        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+        if has_bias:
+            self.bias._ensure_cpu()
+            out += self.bias._data[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis]
+
+        rg = (x._requires_grad or self.weight._requires_grad) and _ag.is_grad_enabled()
+        grad_fn = None
+        if rg:
+            grad_fn = _ag.Conv3dBackward()
+            inputs = [x, self.weight]
+            if has_bias:
+                inputs.append(self.bias)
+            grad_fn.inputs = inputs
+            grad_fn.saved = {
+                'input': x._data, 'weight': self.weight._data,
+                'padding': self.padding, 'stride': self.stride,
+                'dilation': self.dilation, 'groups': self.groups,
+                'has_bias': has_bias,
+            }
+        return Tensor._wrap(out, rg, grad_fn, x._device)
+
+
+def _im2col_3d(x_padded, kD, kH, kW, sD, sH, sW, dD, dH, dW,
+               D_out, H_out, W_out):
+    """Extract volumetric patches into columns for 3D convolution.
+
+    x_padded: (B, C_in, D_padded, H_padded, W_padded)
+    Returns: (B, C_in*kD*kH*kW, D_out*H_out*W_out)
+    """
+    B, C_in = x_padded.shape[:2]
+    N = D_out * H_out * W_out
+    col = np.zeros((B, C_in * kD * kH * kW, N), dtype=x_padded.dtype)
+
+    idx = 0
+    for c in range(C_in):
+        for d in range(kD):
+            for i in range(kH):
+                for j in range(kW):
+                    d_start = d * dD
+                    h_start = i * dH
+                    w_start = j * dW
+                    patch = x_padded[:, c,
+                                     d_start:d_start + sD * D_out:sD,
+                                     h_start:h_start + sH * H_out:sH,
+                                     w_start:w_start + sW * W_out:sW]
+                    col[:, idx, :] = patch.reshape(B, N)
+                    idx += 1
+    return col
+
+
+# ──────────────────────── ConvTranspose2d ─────────────────────────────
+
+class ConvTranspose2d(Module):
+    """2D transposed convolution (deconvolution) for upsampling.
+
+    Input:  (B, C_in, H, W)
+    Output: (B, C_out, H_out, W_out)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, output_padding=0, groups=1,
+                 bias=True, device=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+        self.output_padding = output_padding if isinstance(output_padding, tuple) else (output_padding, output_padding)
+        self.groups = groups
+        _dev = device or _default_param_device
+
+        kH, kW = self.kernel_size
+        k = 1.0 / math.sqrt(in_channels * kH * kW)
+        w = np.random.uniform(-k, k,
+            (in_channels, out_channels // groups, kH, kW)).astype(np.float32)
+        self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
+
+        if bias:
+            b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
+            self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        x._ensure_cpu()
+        self.weight._ensure_cpu()
+
+        B, C_in, H_in, W_in = x._data.shape
+        kH, kW = self.kernel_size
+        sH, sW = self.stride
+        pH, pW = self.padding
+        opH, opW = self.output_padding
+
+        H_out = (H_in - 1) * sH - 2 * pH + kH + opH
+        W_out = (W_in - 1) * sW - 2 * pW + kW + opW
+
+        # Insert zeros (dilate input by stride)
+        H_dilated = (H_in - 1) * sH + 1
+        W_dilated = (W_in - 1) * sW + 1
+        x_dilated = np.zeros((B, C_in, H_dilated, W_dilated), dtype=np.float32)
+        x_dilated[:, :, ::sH, ::sW] = x._data
+
+        # Pad for full convolution
+        pad_top = kH - 1 - pH
+        pad_bottom = kH - 1 - pH + opH
+        pad_left = kW - 1 - pW
+        pad_right = kW - 1 - pW + opW
+
+        x_padded = np.pad(x_dilated,
+                          ((0, 0), (0, 0),
+                           (max(pad_top, 0), max(pad_bottom, 0)),
+                           (max(pad_left, 0), max(pad_right, 0))),
+                          mode='constant')
+
+        # Flip the weight (rotate 180°) and transpose in/out channels
+        # weight shape: (C_in, C_out/groups, kH, kW)
+        w_flipped = self.weight._data[:, :, ::-1, ::-1]
+        # Reshape for grouped correlation
+        C_out = self.out_channels
+
+        out = np.zeros((B, C_out, H_out, W_out), dtype=np.float32)
+
+        if self.groups == 1:
+            for i in range(kH):
+                for j in range(kW):
+                    patch = x_padded[:, :,
+                                     i:i + H_out,
+                                     j:j + W_out]
+                    # patch: (B, C_in, H_out, W_out)
+                    # w_flipped[:, :, i, j]: (C_in, C_out)
+                    out += np.einsum('bchw,co->bohw',
+                                    patch,
+                                    w_flipped[:, :, i, j])
+        else:
+            c_in_per_group = C_in // self.groups
+            c_out_per_group = C_out // self.groups
+            for grp in range(self.groups):
+                ci_s = grp * c_in_per_group
+                co_s = grp * c_out_per_group
+                for i in range(kH):
+                    for j in range(kW):
+                        patch = x_padded[:, ci_s:ci_s + c_in_per_group,
+                                         i:i + H_out,
+                                         j:j + W_out]
+                        out[:, co_s:co_s + c_out_per_group] += np.einsum(
+                            'bchw,co->bohw',
+                            patch,
+                            w_flipped[ci_s:ci_s + c_in_per_group, :, i, j])
+
+        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+        if has_bias:
+            self.bias._ensure_cpu()
+            out += self.bias._data[np.newaxis, :, np.newaxis, np.newaxis]
+
+        return Tensor._wrap(out.astype(np.float32),
+                            x._requires_grad or self.weight._requires_grad,
+                            None, x._device)
+
+
+# ──────────────────────── ConvTranspose3d ─────────────────────────────
+
+class ConvTranspose3d(Module):
+    """3D transposed convolution for temporal/volumetric upsampling.
+
+    Input:  (B, C_in, D, H, W)
+    Output: (B, C_out, D_out, H_out, W_out)
+    """
+
+    def __init__(self, in_channels, out_channels, kernel_size,
+                 stride=1, padding=0, output_padding=0, groups=1,
+                 bias=True, device=None):
+        super().__init__()
+        self.in_channels = in_channels
+        self.out_channels = out_channels
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size, kernel_size)
+        self.stride = stride if isinstance(stride, tuple) else (stride, stride, stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding, padding)
+        self.output_padding = output_padding if isinstance(output_padding, tuple) else (output_padding, output_padding, output_padding)
+        self.groups = groups
+        _dev = device or _default_param_device
+
+        kD, kH, kW = self.kernel_size
+        k = 1.0 / math.sqrt(in_channels * kD * kH * kW)
+        w = np.random.uniform(-k, k,
+            (in_channels, out_channels // groups, kD, kH, kW)).astype(np.float32)
+        self.weight = Parameter(Tensor(w))
+        _param_to_device(self.weight, _dev)
+        del w
+
+        if bias:
+            b = np.random.uniform(-k, k, (out_channels,)).astype(np.float32)
+            self.bias = Parameter(Tensor(b))
+            _param_to_device(self.bias, _dev)
+            del b
+        else:
+            self.bias = None
+
+    def forward(self, x):
+        x._ensure_cpu()
+        self.weight._ensure_cpu()
+
+        B, C_in, D_in, H_in, W_in = x._data.shape
+        kD, kH, kW = self.kernel_size
+        sD, sH, sW = self.stride
+        pD, pH, pW = self.padding
+        opD, opH, opW = self.output_padding
+
+        D_out = (D_in - 1) * sD - 2 * pD + kD + opD
+        H_out = (H_in - 1) * sH - 2 * pH + kH + opH
+        W_out = (W_in - 1) * sW - 2 * pW + kW + opW
+
+        # Dilate input by stride
+        D_dilated = (D_in - 1) * sD + 1
+        H_dilated = (H_in - 1) * sH + 1
+        W_dilated = (W_in - 1) * sW + 1
+        x_dilated = np.zeros((B, C_in, D_dilated, H_dilated, W_dilated), dtype=np.float32)
+        x_dilated[:, :, ::sD, ::sH, ::sW] = x._data
+
+        pad_d0 = kD - 1 - pD
+        pad_d1 = kD - 1 - pD + opD
+        pad_h0 = kH - 1 - pH
+        pad_h1 = kH - 1 - pH + opH
+        pad_w0 = kW - 1 - pW
+        pad_w1 = kW - 1 - pW + opW
+
+        x_padded = np.pad(x_dilated,
+                          ((0, 0), (0, 0),
+                           (max(pad_d0, 0), max(pad_d1, 0)),
+                           (max(pad_h0, 0), max(pad_h1, 0)),
+                           (max(pad_w0, 0), max(pad_w1, 0))),
+                          mode='constant')
+
+        w_flipped = self.weight._data[:, :, ::-1, ::-1, ::-1]
+        C_out = self.out_channels
+
+        out = np.zeros((B, C_out, D_out, H_out, W_out), dtype=np.float32)
+
+        if self.groups == 1:
+            for d in range(kD):
+                for i in range(kH):
+                    for j in range(kW):
+                        patch = x_padded[:, :,
+                                         d:d + D_out,
+                                         i:i + H_out,
+                                         j:j + W_out]
+                        out += np.einsum('bcdhw,co->bodhw',
+                                        patch,
+                                        w_flipped[:, :, d, i, j])
+
+        has_bias = self.bias is not None and isinstance(self.bias, Parameter)
+        if has_bias:
+            self.bias._ensure_cpu()
+            out += self.bias._data[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis]
+
+        return Tensor._wrap(out.astype(np.float32),
+                            x._requires_grad or self.weight._requires_grad,
+                            None, x._device)
+
+
+# ──────────────────────── BatchNorm2d ──────────────────────────────────
+
+class BatchNorm2d(Module):
+    """2D Batch Normalization over (B, C, H, W) tensors."""
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1,
+                 affine=True, track_running_stats=True, device=None):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        _dev = device or _default_param_device
+
+        if affine:
+            self.weight = Parameter(Tensor(np.ones(num_features, dtype=np.float32)))
+            self.bias = Parameter(Tensor(np.zeros(num_features, dtype=np.float32)))
+            _param_to_device(self.weight, _dev)
+            _param_to_device(self.bias, _dev)
+        else:
+            self.weight = None
+            self.bias = None
+
+        if track_running_stats:
+            self.register_buffer('running_mean',
+                                 Tensor(np.zeros(num_features, dtype=np.float32)))
+            self.register_buffer('running_var',
+                                 Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_buffer('num_batches_tracked',
+                                 Tensor(np.array(0, dtype=np.int64)))
+        else:
+            self.running_mean = None
+            self.running_var = None
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, H, W = x._data.shape
+
+        if self._training:
+            mean = np.mean(x._data, axis=(0, 2, 3))
+            var = np.var(x._data, axis=(0, 2, 3))
+            if self.track_running_stats:
+                self.running_mean._ensure_cpu()
+                self.running_var._ensure_cpu()
+                m = self.momentum
+                self.running_mean._data = (1 - m) * self.running_mean._data + m * mean
+                self.running_var._data = (1 - m) * self.running_var._data + m * var
+                self.num_batches_tracked._data += 1
+        else:
+            if self.track_running_stats:
+                self.running_mean._ensure_cpu()
+                self.running_var._ensure_cpu()
+                mean = self.running_mean._data
+                var = self.running_var._data
+            else:
+                mean = np.mean(x._data, axis=(0, 2, 3))
+                var = np.var(x._data, axis=(0, 2, 3))
+
+        x_norm = (x._data - mean[np.newaxis, :, np.newaxis, np.newaxis]) / \
+                 np.sqrt(var[np.newaxis, :, np.newaxis, np.newaxis] + self.eps)
+
+        if self.affine:
+            self.weight._ensure_cpu()
+            self.bias._ensure_cpu()
+            x_norm = x_norm * self.weight._data[np.newaxis, :, np.newaxis, np.newaxis] + \
+                     self.bias._data[np.newaxis, :, np.newaxis, np.newaxis]
+
+        return Tensor._wrap(x_norm.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+
+# ──────────────────────── BatchNorm3d ──────────────────────────────────
+
+class BatchNorm3d(Module):
+    """3D Batch Normalization over (B, C, D, H, W) tensors."""
+
+    def __init__(self, num_features, eps=1e-5, momentum=0.1,
+                 affine=True, track_running_stats=True, device=None):
+        super().__init__()
+        self.num_features = num_features
+        self.eps = eps
+        self.momentum = momentum
+        self.affine = affine
+        self.track_running_stats = track_running_stats
+        _dev = device or _default_param_device
+
+        if affine:
+            self.weight = Parameter(Tensor(np.ones(num_features, dtype=np.float32)))
+            self.bias = Parameter(Tensor(np.zeros(num_features, dtype=np.float32)))
+            _param_to_device(self.weight, _dev)
+            _param_to_device(self.bias, _dev)
+        else:
+            self.weight = None
+            self.bias = None
+
+        if track_running_stats:
+            self.register_buffer('running_mean',
+                                 Tensor(np.zeros(num_features, dtype=np.float32)))
+            self.register_buffer('running_var',
+                                 Tensor(np.ones(num_features, dtype=np.float32)))
+            self.register_buffer('num_batches_tracked',
+                                 Tensor(np.array(0, dtype=np.int64)))
+        else:
+            self.running_mean = None
+            self.running_var = None
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, D, H, W = x._data.shape
+
+        if self._training:
+            mean = np.mean(x._data, axis=(0, 2, 3, 4))
+            var = np.var(x._data, axis=(0, 2, 3, 4))
+            if self.track_running_stats:
+                self.running_mean._ensure_cpu()
+                self.running_var._ensure_cpu()
+                m = self.momentum
+                self.running_mean._data = (1 - m) * self.running_mean._data + m * mean
+                self.running_var._data = (1 - m) * self.running_var._data + m * var
+                self.num_batches_tracked._data += 1
+        else:
+            if self.track_running_stats:
+                self.running_mean._ensure_cpu()
+                self.running_var._ensure_cpu()
+                mean = self.running_mean._data
+                var = self.running_var._data
+            else:
+                mean = np.mean(x._data, axis=(0, 2, 3, 4))
+                var = np.var(x._data, axis=(0, 2, 3, 4))
+
+        shape = [1, C, 1, 1, 1]
+        x_norm = (x._data - mean.reshape(shape)) / \
+                 np.sqrt(var.reshape(shape) + self.eps)
+
+        if self.affine:
+            self.weight._ensure_cpu()
+            self.bias._ensure_cpu()
+            x_norm = x_norm * self.weight._data.reshape(shape) + \
+                     self.bias._data.reshape(shape)
+
+        return Tensor._wrap(x_norm.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+
+# ──────────────────────── GroupNorm ────────────────────────────────────
+
+class GroupNorm(Module):
+    """Group Normalization (Wu & He, 2018)."""
+
+    def __init__(self, num_groups, num_channels, eps=1e-5, affine=True, device=None):
+        super().__init__()
+        self.num_groups = num_groups
+        self.num_channels = num_channels
+        self.eps = eps
+        self.affine = affine
+        _dev = device or _default_param_device
+
+        assert num_channels % num_groups == 0
+
+        if affine:
+            self.weight = Parameter(Tensor(np.ones(num_channels, dtype=np.float32)))
+            self.bias = Parameter(Tensor(np.zeros(num_channels, dtype=np.float32)))
+            _param_to_device(self.weight, _dev)
+            _param_to_device(self.bias, _dev)
+        else:
+            self.weight = None
+            self.bias = None
+
+    def forward(self, x):
+        x._ensure_cpu()
+        shape = x._data.shape
+        B, C = shape[0], shape[1]
+        G = self.num_groups
+        spatial = shape[2:]
+
+        # Reshape to (B, G, C//G, *spatial)
+        x_grouped = x._data.reshape(B, G, C // G, *spatial)
+        axes = tuple(range(2, x_grouped.ndim))
+        mean = np.mean(x_grouped, axis=axes, keepdims=True)
+        var = np.var(x_grouped, axis=axes, keepdims=True)
+        x_norm = (x_grouped - mean) / np.sqrt(var + self.eps)
+        x_norm = x_norm.reshape(shape)
+
+        if self.affine:
+            self.weight._ensure_cpu()
+            self.bias._ensure_cpu()
+            # Broadcast weight/bias over spatial dims
+            w_shape = [1, C] + [1] * len(spatial)
+            x_norm = x_norm * self.weight._data.reshape(w_shape) + \
+                     self.bias._data.reshape(w_shape)
+
+        rg = x._requires_grad and _ag.is_grad_enabled()
+        return Tensor._wrap(x_norm.astype(np.float32), rg, None, x._device)
+
+
+# ──────────────────────── AvgPool2d / MaxPool2d ───────────────────────
+
+class AvgPool2d(Module):
+    """2D average pooling."""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        if not isinstance(self.stride, tuple):
+            self.stride = (self.stride, self.stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, H, W = x._data.shape
+        kH, kW = self.kernel_size
+        sH, sW = self.stride
+        pH, pW = self.padding
+
+        if pH > 0 or pW > 0:
+            x_padded = np.pad(x._data,
+                              ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+                              mode='constant')
+        else:
+            x_padded = x._data
+
+        H_out = (H + 2 * pH - kH) // sH + 1
+        W_out = (W + 2 * pW - kW) // sW + 1
+
+        out = np.zeros((B, C, H_out, W_out), dtype=np.float32)
+        for i in range(H_out):
+            for j in range(W_out):
+                h_s, w_s = i * sH, j * sW
+                out[:, :, i, j] = np.mean(
+                    x_padded[:, :, h_s:h_s + kH, w_s:w_s + kW],
+                    axis=(2, 3))
+
+        return Tensor._wrap(out, x._requires_grad, None, x._device)
+
+
+class MaxPool2d(Module):
+    """2D max pooling."""
+
+    def __init__(self, kernel_size, stride=None, padding=0):
+        super().__init__()
+        self.kernel_size = kernel_size if isinstance(kernel_size, tuple) else (kernel_size, kernel_size)
+        self.stride = stride if stride is not None else self.kernel_size
+        if not isinstance(self.stride, tuple):
+            self.stride = (self.stride, self.stride)
+        self.padding = padding if isinstance(padding, tuple) else (padding, padding)
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, H, W = x._data.shape
+        kH, kW = self.kernel_size
+        sH, sW = self.stride
+        pH, pW = self.padding
+
+        if pH > 0 or pW > 0:
+            x_padded = np.pad(x._data,
+                              ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+                              mode='constant', constant_values=-np.inf)
+        else:
+            x_padded = x._data
+
+        H_out = (H + 2 * pH - kH) // sH + 1
+        W_out = (W + 2 * pW - kW) // sW + 1
+
+        out = np.zeros((B, C, H_out, W_out), dtype=np.float32)
+        for i in range(H_out):
+            for j in range(W_out):
+                h_s, w_s = i * sH, j * sW
+                out[:, :, i, j] = np.max(
+                    x_padded[:, :, h_s:h_s + kH, w_s:w_s + kW],
+                    axis=(2, 3))
+
+        return Tensor._wrap(out, x._requires_grad, None, x._device)
+
+
+# ──────────────────────── AdaptiveAvgPool2d ───────────────────────────
+
+class AdaptiveAvgPool2d(Module):
+    """Adaptive 2D average pooling to a target output size."""
+
+    def __init__(self, output_size):
+        super().__init__()
+        if isinstance(output_size, int):
+            self.output_size = (output_size, output_size)
+        else:
+            self.output_size = tuple(output_size)
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, H, W = x._data.shape
+        oH, oW = self.output_size
+
+        out = np.zeros((B, C, oH, oW), dtype=np.float32)
+        for i in range(oH):
+            h_start = int(np.floor(i * H / oH))
+            h_end = int(np.ceil((i + 1) * H / oH))
+            for j in range(oW):
+                w_start = int(np.floor(j * W / oW))
+                w_end = int(np.ceil((j + 1) * W / oW))
+                out[:, :, i, j] = np.mean(
+                    x._data[:, :, h_start:h_end, w_start:w_end], axis=(2, 3))
+
+        return Tensor._wrap(out, x._requires_grad, None, x._device)
+
+
+# ──────────────────────── Upsample ────────────────────────────────────
+
+class Upsample(Module):
+    """Upsample spatial (or spatio-temporal) data via nearest or bilinear interpolation."""
+
+    def __init__(self, scale_factor=None, size=None, mode='nearest'):
+        super().__init__()
+        self.scale_factor = scale_factor
+        self.size = size
+        self.mode = mode
+
+    def forward(self, x):
+        x._ensure_cpu()
+        data = x._data
+        ndim = data.ndim
+
+        if ndim == 4:  # (B, C, H, W)
+            return self._upsample_2d(x)
+        elif ndim == 5:  # (B, C, D, H, W)
+            return self._upsample_3d(x)
+        else:
+            raise ValueError(f"Upsample expects 4D or 5D input, got {ndim}D")
+
+    def _upsample_2d(self, x):
+        B, C, H, W = x._data.shape
+        if self.size is not None:
+            oH, oW = self.size if isinstance(self.size, tuple) else (self.size, self.size)
+        else:
+            sf = self.scale_factor
+            if isinstance(sf, (tuple, list)):
+                oH, oW = int(H * sf[0]), int(W * sf[1])
+            else:
+                oH, oW = int(H * sf), int(W * sf)
+
+        if self.mode == 'nearest':
+            row_idx = (np.arange(oH) * H / oH).astype(int)
+            col_idx = (np.arange(oW) * W / oW).astype(int)
+            out = x._data[:, :, row_idx[:, None], col_idx[None, :]]
+        elif self.mode == 'bilinear':
+            out = _bilinear_interp_2d(x._data, oH, oW)
+        else:
+            raise ValueError(f"Unsupported upsample mode: {self.mode}")
+
+        return Tensor._wrap(out.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+    def _upsample_3d(self, x):
+        B, C, D, H, W = x._data.shape
+        if self.size is not None:
+            if isinstance(self.size, (tuple, list)):
+                oD, oH, oW = self.size
+            else:
+                oD = oH = oW = self.size
+        else:
+            sf = self.scale_factor
+            if isinstance(sf, (tuple, list)):
+                oD, oH, oW = int(D * sf[0]), int(H * sf[1]), int(W * sf[2])
+            else:
+                oD, oH, oW = int(D * sf), int(H * sf), int(W * sf)
+
+        if self.mode == 'nearest':
+            d_idx = (np.arange(oD) * D / oD).astype(int)
+            h_idx = (np.arange(oH) * H / oH).astype(int)
+            w_idx = (np.arange(oW) * W / oW).astype(int)
+            out = x._data[:, :,
+                          d_idx[:, None, None],
+                          h_idx[None, :, None],
+                          w_idx[None, None, :]]
+        else:
+            # Trilinear: upsample depth then bilinear
+            # First upsample along depth axis
+            d_idx = np.linspace(0, D - 1, oD)
+            d_floor = np.floor(d_idx).astype(int)
+            d_ceil = np.minimum(d_floor + 1, D - 1)
+            d_frac = (d_idx - d_floor).reshape(1, 1, oD, 1, 1).astype(np.float32)
+
+            temp = x._data[:, :, d_floor] * (1 - d_frac) + x._data[:, :, d_ceil] * d_frac
+            # Now bilinear on each spatial slice
+            result = np.zeros((B, C, oD, oH, oW), dtype=np.float32)
+            for di in range(oD):
+                result[:, :, di] = _bilinear_interp_2d(temp[:, :, di], oH, oW)
+            out = result
+
+        return Tensor._wrap(out.astype(np.float32),
+                            x._requires_grad, None, x._device)
+
+
+def _bilinear_interp_2d(data, oH, oW):
+    """Bilinear interpolation for 4D (B, C, H, W) or 3D (B, C, HW_slice) data."""
+    B, C, H, W = data.shape
+    h_idx = np.linspace(0, H - 1, oH)
+    w_idx = np.linspace(0, W - 1, oW)
+    hg, wg = np.meshgrid(h_idx, w_idx, indexing='ij')
+
+    h0 = np.floor(hg).astype(int)
+    h1 = np.minimum(h0 + 1, H - 1)
+    w0 = np.floor(wg).astype(int)
+    w1 = np.minimum(w0 + 1, W - 1)
+
+    ha = (hg - h0).astype(np.float32)
+    wa = (wg - w0).astype(np.float32)
+
+    out = (data[:, :, h0, w0] * (1 - ha) * (1 - wa) +
+           data[:, :, h1, w0] * ha * (1 - wa) +
+           data[:, :, h0, w1] * (1 - ha) * wa +
+           data[:, :, h1, w1] * ha * wa)
+    return out
+
+
+# ──────────────────────── Tanh ────────────────────────────────────────
+
+class Tanh(Module):
+    """Hyperbolic tangent activation."""
+
+    def forward(self, x):
+        x._ensure_cpu()
+        result_data = np.tanh(x._data)
+        rg = x._requires_grad and _ag.is_grad_enabled()
+        grad_fn = None
+        if rg:
+            grad_fn = _ag.TanhBackward()
+            grad_fn.inputs = [x]
+            grad_fn.saved = {'result': result_data}
+        return Tensor._wrap(result_data, rg, grad_fn, x._device)
+
+
+# ──────────────────────── Sigmoid (Module) ────────────────────────────
+
+class Sigmoid(Module):
+    """Sigmoid activation as a module."""
+
+    def forward(self, x):
+        return x.sigmoid()
+
+
+# ──────────────────────── PixelShuffle ────────────────────────────────
+
+class PixelShuffle(Module):
+    """Rearrange (B, C*r^2, H, W) → (B, C, H*r, W*r)."""
+
+    def __init__(self, upscale_factor):
+        super().__init__()
+        self.upscale_factor = upscale_factor
+
+    def forward(self, x):
+        x._ensure_cpu()
+        B, C, H, W = x._data.shape
+        r = self.upscale_factor
+        assert C % (r * r) == 0
+        C_out = C // (r * r)
+        out = x._data.reshape(B, C_out, r, r, H, W)
+        out = out.transpose(0, 1, 4, 2, 5, 3)
+        out = out.reshape(B, C_out, H * r, W * r)
+        return Tensor._wrap(out.copy().astype(np.float32),
+                            x._requires_grad, None, x._device)
 
 
 class DataParallel(Module):

@@ -867,3 +867,211 @@ class PadBackward(GradFn):
     def backward(self, g):
         slices = self.saved['slices']
         return (g[tuple(slices)],)
+
+
+class Conv2dBackward(GradFn):
+    """Backward pass for 2D convolution."""
+
+    def __init__(self):
+        super().__init__('Conv2dBackward')
+
+    def backward(self, g):
+        x = self.saved['input']
+        weight = self.saved['weight']
+        padding = self.saved['padding']
+        stride = self.saved['stride']
+        dilation = self.saved['dilation']
+        groups = self.saved['groups']
+        has_bias = self.saved['has_bias']
+
+        B, C_out, H_out, W_out = g.shape
+        B, C_in, H_in, W_in = x.shape
+        _, C_in_g, kH, kW = weight.shape
+        pH, pW = padding
+        sH, sW = stride
+        dH, dW = dilation
+
+        # Pad input
+        if pH > 0 or pW > 0:
+            x_padded = np.pad(x, ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+                              mode='constant')
+        else:
+            x_padded = x
+
+        grad_bias = np.sum(g, axis=(0, 2, 3)) if has_bias else None
+
+        if groups == 1:
+            # im2col forward
+            from .nn.layers import _im2col_2d
+            col = _im2col_2d(x_padded, kH, kW, sH, sW, dH, dW, H_out, W_out)
+            g_reshaped = g.reshape(B, C_out, H_out * W_out)
+
+            # grad_weight: (C_out, C_in*kH*kW) from einsum('boN,biN->oi')
+            w_2d = weight.reshape(C_out, -1)
+            grad_weight_2d = np.einsum('boN,biN->oi', g_reshaped, col)
+            grad_weight = grad_weight_2d.reshape(weight.shape)
+
+            # grad_input via col2im
+            col_grad = np.einsum('oi,boN->biN', w_2d, g_reshaped)
+            # col_grad: (B, C_in*kH*kW, H_out*W_out)
+            Hp, Wp = x_padded.shape[2], x_padded.shape[3]
+            grad_padded = np.zeros((B, C_in, Hp, Wp), dtype=x.dtype)
+
+            idx = 0
+            for c in range(C_in):
+                for i in range(kH):
+                    for j in range(kW):
+                        h_start = i * dH
+                        w_start = j * dW
+                        grad_padded[:, c,
+                                    h_start:h_start + sH * H_out:sH,
+                                    w_start:w_start + sW * W_out:sW] += \
+                            col_grad[:, idx, :].reshape(B, H_out, W_out)
+                        idx += 1
+
+            if pH > 0 or pW > 0:
+                grad_input = grad_padded[:, :, pH:-pH if pH > 0 else None,
+                                         pW:-pW if pW > 0 else None]
+            else:
+                grad_input = grad_padded
+        else:
+            c_in_per_group = C_in // groups
+            c_out_per_group = C_out // groups
+            grad_input = np.zeros_like(x)
+            grad_weight = np.zeros_like(weight)
+
+            for grp in range(groups):
+                co_s = grp * c_out_per_group
+                ci_s = grp * c_in_per_group
+                g_grp = g[:, co_s:co_s + c_out_per_group]
+                x_grp_padded = x_padded[:, ci_s:ci_s + c_in_per_group]
+
+                from .nn.layers import _im2col_2d
+                col_grp = _im2col_2d(x_grp_padded, kH, kW, sH, sW,
+                                     dH, dW, H_out, W_out)
+                g_grp_r = g_grp.reshape(B, c_out_per_group, H_out * W_out)
+                w_grp = weight[co_s:co_s + c_out_per_group].reshape(c_out_per_group, -1)
+
+                grad_weight[co_s:co_s + c_out_per_group] = \
+                    np.einsum('boN,biN->oi', g_grp_r, col_grp).reshape(
+                        c_out_per_group, c_in_per_group, kH, kW)
+
+                col_grad_grp = np.einsum('oi,boN->biN', w_grp, g_grp_r)
+                Hp, Wp = x_grp_padded.shape[2], x_grp_padded.shape[3]
+                grad_padded = np.zeros((B, c_in_per_group, Hp, Wp), dtype=x.dtype)
+
+                idx = 0
+                for c in range(c_in_per_group):
+                    for i in range(kH):
+                        for j in range(kW):
+                            h_start = i * dH
+                            w_start = j * dW
+                            grad_padded[:, c,
+                                        h_start:h_start + sH * H_out:sH,
+                                        w_start:w_start + sW * W_out:sW] += \
+                                col_grad_grp[:, idx, :].reshape(B, H_out, W_out)
+                            idx += 1
+
+                if pH > 0 or pW > 0:
+                    grad_input[:, ci_s:ci_s + c_in_per_group] = \
+                        grad_padded[:, :, pH:-pH if pH > 0 else None,
+                                    pW:-pW if pW > 0 else None]
+                else:
+                    grad_input[:, ci_s:ci_s + c_in_per_group] = grad_padded
+
+        results = [grad_input, grad_weight]
+        if has_bias:
+            results.append(grad_bias)
+        return tuple(results)
+
+
+class Conv3dBackward(GradFn):
+    """Backward pass for 3D convolution."""
+
+    def __init__(self):
+        super().__init__('Conv3dBackward')
+
+    def backward(self, g):
+        x = self.saved['input']
+        weight = self.saved['weight']
+        padding = self.saved['padding']
+        stride = self.saved['stride']
+        dilation = self.saved['dilation']
+        groups = self.saved['groups']
+        has_bias = self.saved['has_bias']
+
+        B, C_out, D_out, H_out, W_out = g.shape
+        B, C_in, D_in, H_in, W_in = x.shape
+        _, C_in_g, kD, kH, kW = weight.shape
+        pD, pH, pW = padding
+        sD, sH, sW = stride
+        dD, dH, dW = dilation
+
+        # Pad input
+        if pD > 0 or pH > 0 or pW > 0:
+            x_padded = np.pad(x, ((0, 0), (0, 0),
+                                  (pD, pD), (pH, pH), (pW, pW)),
+                              mode='constant')
+        else:
+            x_padded = x
+
+        grad_bias = np.sum(g, axis=(0, 2, 3, 4)) if has_bias else None
+
+        N = D_out * H_out * W_out
+
+        if groups == 1:
+            from .nn.layers import _im2col_3d
+            col = _im2col_3d(x_padded, kD, kH, kW, sD, sH, sW,
+                             dD, dH, dW, D_out, H_out, W_out)
+            g_reshaped = g.reshape(B, C_out, N)
+            w_2d = weight.reshape(C_out, -1)
+
+            grad_weight_2d = np.einsum('boN,biN->oi', g_reshaped, col)
+            grad_weight = grad_weight_2d.reshape(weight.shape)
+
+            col_grad = np.einsum('oi,boN->biN', w_2d, g_reshaped)
+
+            Dp, Hp, Wp = x_padded.shape[2], x_padded.shape[3], x_padded.shape[4]
+            grad_padded = np.zeros((B, C_in, Dp, Hp, Wp), dtype=x.dtype)
+
+            idx = 0
+            for c in range(C_in):
+                for d in range(kD):
+                    for i in range(kH):
+                        for j in range(kW):
+                            d_start = d * dD
+                            h_start = i * dH
+                            w_start = j * dW
+                            grad_padded[:, c,
+                                        d_start:d_start + sD * D_out:sD,
+                                        h_start:h_start + sH * H_out:sH,
+                                        w_start:w_start + sW * W_out:sW] += \
+                                col_grad[:, idx, :].reshape(B, D_out, H_out, W_out)
+                            idx += 1
+
+            if pD > 0 or pH > 0 or pW > 0:
+                d_sl = slice(pD, -pD if pD > 0 else None)
+                h_sl = slice(pH, -pH if pH > 0 else None)
+                w_sl = slice(pW, -pW if pW > 0 else None)
+                grad_input = grad_padded[:, :, d_sl, h_sl, w_sl]
+            else:
+                grad_input = grad_padded
+        else:
+            grad_input = np.zeros_like(x)
+            grad_weight = np.zeros_like(weight)
+
+        results = [grad_input, grad_weight]
+        if has_bias:
+            results.append(grad_bias)
+        return tuple(results)
+
+
+class TanhBackward(GradFn):
+    """Backward for tanh activation."""
+
+    def __init__(self):
+        super().__init__('TanhBackward')
+
+    def backward(self, g):
+        t = self.saved['result']
+        return (g * (1.0 - t * t),)

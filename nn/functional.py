@@ -393,3 +393,211 @@ def linear(input: Tensor, weight: Tensor,
             result_data = result_data + bias._data
     rg = (input._requires_grad or weight._requires_grad) and _ag.is_grad_enabled()
     return Tensor._wrap(result_data, rg, None, input._device)
+
+
+# ──────────────────────── Convolutions (functional) ───────────────────
+
+def conv2d(input: Tensor, weight: Tensor, bias: Tensor | None = None,
+           stride=1, padding=0, dilation=1, groups=1) -> Tensor:
+    """Functional 2D convolution."""
+    from .layers import _im2col_2d
+
+    input._ensure_cpu()
+    weight._ensure_cpu()
+
+    s = stride if isinstance(stride, tuple) else (stride, stride)
+    p = padding if isinstance(padding, tuple) else (padding, padding)
+    d = dilation if isinstance(dilation, tuple) else (dilation, dilation)
+
+    B, C_in, H, W = input._data.shape
+    C_out, C_in_g, kH, kW = weight._data.shape
+    sH, sW = s
+    pH, pW = p
+    dH, dW = d
+
+    H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+    W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+
+    if pH > 0 or pW > 0:
+        x_padded = np.pad(input._data,
+                          ((0, 0), (0, 0), (pH, pH), (pW, pW)),
+                          mode='constant')
+    else:
+        x_padded = input._data
+
+    col = _im2col_2d(x_padded, kH, kW, sH, sW, dH, dW, H_out, W_out)
+
+    if groups == 1:
+        w_2d = weight._data.reshape(C_out, -1)
+        out = np.einsum('oi,biN->boN', w_2d, col)
+        out = out.reshape(B, C_out, H_out, W_out)
+    else:
+        c_in_pg = C_in // groups
+        c_out_pg = C_out // groups
+        out = np.zeros((B, C_out, H_out * W_out), dtype=np.float32)
+        for grp in range(groups):
+            ci_s = grp * c_in_pg
+            co_s = grp * c_out_pg
+            k_size = c_in_pg * kH * kW
+            col_grp = col[:, ci_s * kH * kW:ci_s * kH * kW + k_size, :]
+            w_grp = weight._data[co_s:co_s + c_out_pg].reshape(c_out_pg, -1)
+            out[:, co_s:co_s + c_out_pg, :] = np.einsum('oi,biN->boN', w_grp, col_grp)
+        out = out.reshape(B, C_out, H_out, W_out)
+
+    if bias is not None:
+        bias._ensure_cpu()
+        out += bias._data[np.newaxis, :, np.newaxis, np.newaxis]
+
+    rg = (input._requires_grad or weight._requires_grad) and _ag.is_grad_enabled()
+    grad_fn = None
+    if rg:
+        grad_fn = _ag.Conv2dBackward()
+        inputs_list = [input, weight]
+        if bias is not None:
+            inputs_list.append(bias)
+        grad_fn.inputs = inputs_list
+        grad_fn.saved = {
+            'input': input._data, 'weight': weight._data,
+            'padding': p, 'stride': s, 'dilation': d, 'groups': groups,
+            'has_bias': bias is not None,
+        }
+    return Tensor._wrap(out, rg, grad_fn, input._device)
+
+
+def conv3d(input: Tensor, weight: Tensor, bias: Tensor | None = None,
+           stride=1, padding=0, dilation=1, groups=1) -> Tensor:
+    """Functional 3D convolution."""
+    from .layers import _im2col_3d
+
+    input._ensure_cpu()
+    weight._ensure_cpu()
+
+    s = stride if isinstance(stride, tuple) else (stride, stride, stride)
+    p = padding if isinstance(padding, tuple) else (padding, padding, padding)
+    d = dilation if isinstance(dilation, tuple) else (dilation, dilation, dilation)
+
+    B, C_in, D, H, W = input._data.shape
+    C_out, C_in_g, kD, kH, kW = weight._data.shape
+    sD, sH, sW = s
+    pD, pH, pW = p
+    dD, dH, dW = d
+
+    D_out = (D + 2 * pD - dD * (kD - 1) - 1) // sD + 1
+    H_out = (H + 2 * pH - dH * (kH - 1) - 1) // sH + 1
+    W_out = (W + 2 * pW - dW * (kW - 1) - 1) // sW + 1
+
+    if pD > 0 or pH > 0 or pW > 0:
+        x_padded = np.pad(input._data,
+                          ((0, 0), (0, 0), (pD, pD), (pH, pH), (pW, pW)),
+                          mode='constant')
+    else:
+        x_padded = input._data
+
+    col = _im2col_3d(x_padded, kD, kH, kW, sD, sH, sW,
+                     dD, dH, dW, D_out, H_out, W_out)
+
+    if groups == 1:
+        w_2d = weight._data.reshape(C_out, -1)
+        out = np.einsum('oi,biN->boN', w_2d, col)
+        N = D_out * H_out * W_out
+        out = out.reshape(B, C_out, D_out, H_out, W_out)
+    else:
+        c_in_pg = C_in // groups
+        c_out_pg = C_out // groups
+        N = D_out * H_out * W_out
+        out = np.zeros((B, C_out, N), dtype=np.float32)
+        for grp in range(groups):
+            ci_s = grp * c_in_pg
+            co_s = grp * c_out_pg
+            k_size = c_in_pg * kD * kH * kW
+            col_grp = col[:, ci_s * kD * kH * kW:ci_s * kD * kH * kW + k_size, :]
+            w_grp = weight._data[co_s:co_s + c_out_pg].reshape(c_out_pg, -1)
+            out[:, co_s:co_s + c_out_pg, :] = np.einsum('oi,biN->boN', w_grp, col_grp)
+        out = out.reshape(B, C_out, D_out, H_out, W_out)
+
+    if bias is not None:
+        bias._ensure_cpu()
+        out += bias._data[np.newaxis, :, np.newaxis, np.newaxis, np.newaxis]
+
+    rg = (input._requires_grad or weight._requires_grad) and _ag.is_grad_enabled()
+    grad_fn = None
+    if rg:
+        grad_fn = _ag.Conv3dBackward()
+        inputs_list = [input, weight]
+        if bias is not None:
+            inputs_list.append(bias)
+        grad_fn.inputs = inputs_list
+        grad_fn.saved = {
+            'input': input._data, 'weight': weight._data,
+            'padding': p, 'stride': s, 'dilation': d, 'groups': groups,
+            'has_bias': bias is not None,
+        }
+    return Tensor._wrap(out, rg, grad_fn, input._device)
+
+
+def interpolate(input: Tensor, size=None, scale_factor=None,
+                mode='nearest') -> Tensor:
+    """Functional interface for upsampling / downsampling.
+
+    Supports 4D (B, C, H, W) and 5D (B, C, D, H, W) inputs.
+    Modes: 'nearest', 'bilinear', 'trilinear'.
+    """
+    from .layers import Upsample
+    up = Upsample(scale_factor=scale_factor, size=size, mode=mode)
+    return up(input)
+
+
+def group_norm(input: Tensor, num_groups: int, weight=None,
+               bias=None, eps=1e-5) -> Tensor:
+    """Functional group normalization."""
+    input._ensure_cpu()
+    shape = input._data.shape
+    B, C = shape[0], shape[1]
+    spatial = shape[2:]
+    G = num_groups
+
+    x_grouped = input._data.reshape(B, G, C // G, *spatial)
+    axes = tuple(range(2, x_grouped.ndim))
+    mean = np.mean(x_grouped, axis=axes, keepdims=True)
+    var = np.var(x_grouped, axis=axes, keepdims=True)
+    x_norm = (x_grouped - mean) / np.sqrt(var + eps)
+    x_norm = x_norm.reshape(shape)
+
+    if weight is not None:
+        weight._ensure_cpu()
+        w_shape = [1, C] + [1] * len(spatial)
+        x_norm = x_norm * weight._data.reshape(w_shape)
+    if bias is not None:
+        bias._ensure_cpu()
+        b_shape = [1, C] + [1] * len(spatial)
+        x_norm = x_norm + bias._data.reshape(b_shape)
+
+    return Tensor._wrap(x_norm.astype(np.float32),
+                        input._requires_grad, None, input._device)
+
+
+def tanh(input: Tensor) -> Tensor:
+    """Functional tanh."""
+    input._ensure_cpu()
+    result_data = np.tanh(input._data)
+    rg = input._requires_grad and _ag.is_grad_enabled()
+    grad_fn = None
+    if rg:
+        grad_fn = _ag.TanhBackward()
+        grad_fn.inputs = [input]
+        grad_fn.saved = {'result': result_data}
+    return Tensor._wrap(result_data, rg, grad_fn, input._device)
+
+
+def avg_pool2d(input: Tensor, kernel_size, stride=None, padding=0) -> Tensor:
+    """Functional 2D average pooling."""
+    from .layers import AvgPool2d
+    pool = AvgPool2d(kernel_size, stride=stride, padding=padding)
+    return pool(input)
+
+
+def adaptive_avg_pool2d(input: Tensor, output_size) -> Tensor:
+    """Functional adaptive 2D average pooling."""
+    from .layers import AdaptiveAvgPool2d
+    pool = AdaptiveAvgPool2d(output_size)
+    return pool(input)
