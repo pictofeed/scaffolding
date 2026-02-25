@@ -72,6 +72,7 @@ from . import distributed
 from . import backends
 from . import cuda
 from . import utils
+from . import diffusion
 
 __all__ = [
     "__version__",
@@ -94,8 +95,5 @@ __all__ = [
     # Utility
     'manual_seed', 'save', 'load', 'compile', 'set_float32_matmul_precision',
     # Sub-packages
-    'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils',
+    'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils', 'diffusion',
 ]
-
-# Note: 'diffusion' is a submodule and should be imported as 'scaffolding.diffusion'.
-# It is not included in __all__ to avoid circular import issues.
