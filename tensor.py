@@ -50,9 +50,17 @@ def _is_cuda(device) -> bool:
     """Check if device is CUDA."""
     return device is not None and device._type == 'cuda'
 
-
-# Singleton CPU device to avoid repeated Device('cpu') allocation
+# Singleton
 _CPU_DEVICE = Device('cpu')
+
+# All NumPy dtypes eligible for automatic CUDA upload.  The underlying
+# gputensor_from_numpy does a raw-byte memcpy, so any dtype works — this
+# set just controls which types we eagerly move to GPU.
+_CUDA_UPLOADABLE_DTYPES = frozenset({
+    np.float32, np.float64, np.float16,
+    np.int64, np.int32, np.int16, np.int8,
+    np.uint8,
+})
 
 
 class Tensor:
@@ -98,8 +106,8 @@ class Tensor:
         self._device: Device = Device(device) if device is not None else _CPU_DEVICE
         self._version: int = 0
         self._gpu = None
-        # Upload to GPU if CUDA device (float32 and int64)
-        if _USE_CUDA and _is_cuda(self._device) and arr.dtype in (np.float32, np.int64):
+        # Upload to GPU if CUDA device (all numeric dtypes)
+        if _USE_CUDA and _is_cuda(self._device) and arr.dtype in _CUDA_UPLOADABLE_DTYPES:
             target_dev = self._device._index if self._device._index is not None else 0
             self._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), target_dev)
             self._data = None         # ← GPU is canonical; drop CPU copy
@@ -1000,7 +1008,7 @@ class Tensor:
             grad_fn.saved = {'dim0': dim0, 'dim1': dim1}
         t = Tensor._wrap(result_data, rg, grad_fn, self._device)
         # Re-upload to GPU if we're on CUDA
-        if _USE_CUDA and _is_cuda(self._device) and t._data.dtype == np.float32:
+        if _USE_CUDA and _is_cuda(self._device) and t._data.dtype in _CUDA_UPLOADABLE_DTYPES:
             _dev = self._device._index if self._device._index is not None else 0
             t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(t._data), _dev)
             t._data = None            # ← GPU is canonical; drop CPU copy
@@ -1183,7 +1191,7 @@ class Tensor:
                 np_dt = new_dtype.to_numpy() if isinstance(new_dtype, Dtype) else new_dtype
                 arr = arr.astype(np_dt)
 
-            if arr.dtype in (np.float32, np.int64):
+            if arr.dtype in _CUDA_UPLOADABLE_DTYPES:
                 t = Tensor.__new__(Tensor)
                 t._gpu = _cuops.gputensor_from_numpy(
                     np.ascontiguousarray(arr), target_dev)
@@ -1356,7 +1364,7 @@ def _resolve_device(device) -> Device:
 def _make_tensor(arr: np.ndarray, requires_grad: bool, device: Device) -> Tensor:
     """Create a Tensor, auto-uploading to GPU if device is CUDA."""
     t = Tensor._wrap(arr, requires_grad, None, device)
-    if _USE_CUDA and _is_cuda(device) and arr.dtype in (np.float32, np.int64):
+    if _USE_CUDA and _is_cuda(device) and arr.dtype in _CUDA_UPLOADABLE_DTYPES:
         _dev = device._index if device._index is not None else 0
         t._gpu = _cuops.gputensor_from_numpy(np.ascontiguousarray(arr), _dev)
         t._data = None                # ← GPU is canonical; drop CPU copy

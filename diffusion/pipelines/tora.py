@@ -130,6 +130,7 @@ class ToraPipeline:
         generator: Optional[Any] = None,
         callback: Optional[Callable] = None,
         callback_steps: int = 1,
+        output_type: str = "pil",
     ) -> Tensor:
         """Run the Tora text-to-video (or trajectory-guided) pipeline.
 
@@ -154,6 +155,11 @@ class ToraPipeline:
                                   for reproducible noise initialisation.
             callback:             ``callback(step, timestep, latents)``.
             callback_steps:       Invoke *callback* every N steps.
+            output_type:          ``"pil"`` (default) returns PipelineOutput
+                                  with PIL Images.  ``"sf_tensor"`` returns
+                                  PipelineOutput where each frame is a
+                                  GPU-resident uint8 sf.Tensor (H, W, C) —
+                                  no CPU memory is allocated.
 
         Returns:
             ``Tensor`` of shape ``(B, C, num_frames, H, W)`` (video) or
@@ -311,9 +317,18 @@ class ToraPipeline:
 
         # ── decode latents → PipelineOutput (memory-efficient) ──
         # Instead of accumulating all decoded frames then converting,
-        # stream each frame through the VAE and directly to PIL.
+        # stream each frame through the VAE and directly to output.
         # Peak memory: ONE decoded frame, not the full video.
-        from PIL import Image
+        #
+        # output_type controls the format:
+        #   "pil"       → PIL Images on CPU (legacy, higher CPU RAM)
+        #   "sf_tensor"  → GPU-resident uint8 sf.Tensor (H,W,C) per frame
+        #                  (zero CPU allocation — ideal for low-RAM hosts)
+
+        gpu_output = (output_type == "sf_tensor")
+
+        if not gpu_output:
+            from PIL import Image
 
         if self.vae is not None:
             latents._ensure_cpu()
@@ -321,9 +336,9 @@ class ToraPipeline:
             del latents  # free latents immediately
 
             if z_data.ndim == 5:
-                # (B, C, F, H, W) — per-frame VAE decode → PIL
+                # (B, C, F, H, W) — per-frame VAE decode
                 B_, C_, F_, H_, W_ = z_data.shape
-                all_batches: list[list[Image.Image]] = [[] for _ in range(B_)]
+                all_batches: list = [[] for _ in range(B_)]
                 for f_idx in range(F_):
                     frame_z = Tensor._wrap(
                         z_data[:, :, f_idx, :, :].copy().astype(_np_dtype),
@@ -336,10 +351,17 @@ class ToraPipeline:
                     del frame_dec
                     fd = ((fd + 1.0) * 127.5).astype(np.uint8)
                     for b in range(B_):
-                        img = fd[b].transpose(1, 2, 0)  # (C,H,W) → (H,W,C)
-                        if img.shape[-1] == 1:
-                            img = img.squeeze(-1)
-                        all_batches[b].append(Image.fromarray(img))
+                        img_data = fd[b].transpose(1, 2, 0)  # (C,H,W) → (H,W,C)
+                        if img_data.shape[-1] == 1:
+                            img_data = img_data.squeeze(-1)
+                        if gpu_output:
+                            # Upload uint8 frame directly to GPU — no PIL
+                            gpu_device = getattr(self, '_device_str', 'cuda')
+                            all_batches[b].append(
+                                Tensor(img_data.copy(), device=gpu_device))
+                        else:
+                            from PIL import Image
+                            all_batches[b].append(Image.fromarray(img_data))
                     del fd
                 del z_data
                 return PipelineOutput(frames=all_batches)
@@ -352,6 +374,8 @@ class ToraPipeline:
             output = latents
 
         # Fallback for non-video or no-VAE path
+        if gpu_output:
+            return self._tensor_to_gpu_pipeline_output(output)
         return self._tensor_to_pipeline_output(output)
 
     @staticmethod
@@ -393,6 +417,43 @@ class ToraPipeline:
         else:
             raise ValueError(f"Expected 4-D or 5-D tensor, got {data.ndim}-D")
 
+        return PipelineOutput(frames=all_batches)
+
+    @staticmethod
+    def _tensor_to_gpu_pipeline_output(tensor_out: Tensor) -> PipelineOutput:
+        """Convert a decoded tensor to ``PipelineOutput`` with GPU-resident
+        uint8 sf.Tensor frames (H, W, C).  No CPU/PIL allocation.
+
+        Handles both 4-D ``(B, C, H, W)`` single-image and 5-D
+        ``(B, C, F, H, W)`` video tensors.
+        """
+        tensor_out._ensure_cpu()
+        data = tensor_out._data  # float32 in [-1, 1]
+        data = ((data + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+
+        all_batches: list = []
+
+        if data.ndim == 5:
+            B, C, F, H, W = data.shape
+            for b in range(B):
+                frames = []
+                for f in range(F):
+                    frame = data[b, :, f].transpose(1, 2, 0)  # (C,H,W)→(H,W,C)
+                    if C == 1:
+                        frame = frame.squeeze(-1)
+                    frames.append(Tensor(frame.copy(), device="cuda"))
+                all_batches.append(frames)
+        elif data.ndim == 4:
+            B, C, H, W = data.shape
+            for b in range(B):
+                frame = data[b].transpose(1, 2, 0)
+                if C == 1:
+                    frame = frame.squeeze(-1)
+                all_batches.append([Tensor(frame.copy(), device="cuda")])
+        else:
+            raise ValueError(f"Expected 4-D or 5-D tensor, got {data.ndim}-D")
+
+        del data
         return PipelineOutput(frames=all_batches)
 
 def _load_pipeline(*args, **kwargs):
