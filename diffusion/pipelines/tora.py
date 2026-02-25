@@ -21,6 +21,25 @@ from scaffolding.diffusion.schedulers import DDIMScheduler
 from scaffolding.diffusion.models import UNet2DConditionModel, AutoencoderKL
 from scaffolding.diffusion.utils import classifier_free_guidance, randn_tensor
 
+
+# ── Pipeline output wrapper ──
+
+class PipelineOutput:
+    """Wraps pipeline output to provide a ``.frames`` attribute.
+
+    ``frames`` is a list of lists of PIL Images: ``frames[batch_idx]``
+    gives the list of video frames for that sample.
+    """
+
+    def __init__(self, frames: list):
+        self.frames = frames
+
+    def __repr__(self):
+        n_batches = len(self.frames)
+        n_frames = len(self.frames[0]) if self.frames else 0
+        return f"PipelineOutput(batches={n_batches}, frames_per_batch={n_frames})"
+
+
 class ToraPipeline:
     
     @classmethod
@@ -51,6 +70,23 @@ class ToraPipeline:
     def enable_sequential_cpu_offload(self):
         """No-op for compatibility with memory optimization APIs."""
         pass
+
+    def to(self, device=None, dtype=None):
+        """Move pipeline components to the given device/dtype.
+
+        Calls ``.to()`` on each sub-module (unet, vae, text_encoder)
+        that supports it.  Returns *self* for chaining.
+        """
+        for attr_name in ('unet', 'vae', 'text_encoder'):
+            comp = getattr(self, attr_name, None)
+            if comp is not None and hasattr(comp, 'to'):
+                if device is not None and dtype is not None:
+                    comp.to(device, dtype=dtype)
+                elif device is not None:
+                    comp.to(device)
+                elif dtype is not None:
+                    comp.to(dtype=dtype)
+        return self
 
     def __init__(
         self,
@@ -278,7 +314,50 @@ class ToraPipeline:
         output = Tensor._wrap(
             np.clip(output._data, -1.0, 1.0).astype(np.float32),
             False, None, None)
-        return output
+
+        # ── convert to PipelineOutput with PIL frames ──
+        return self._tensor_to_pipeline_output(output)
+
+    @staticmethod
+    def _tensor_to_pipeline_output(tensor_out: Tensor) -> PipelineOutput:
+        """Convert a decoded tensor to ``PipelineOutput`` with PIL frames.
+
+        Handles both 4-D ``(B, C, H, W)`` single-image and 5-D
+        ``(B, C, F, H, W)`` video tensors.
+        """
+        from PIL import Image
+
+        tensor_out._ensure_cpu()
+        data = tensor_out._data  # float32 in [-1, 1]
+        # Rescale [-1, 1] → [0, 255] uint8
+        data = ((data + 1.0) * 127.5).clip(0, 255).astype(np.uint8)
+
+        all_batches: list[list[Image.Image]] = []
+
+        if data.ndim == 5:
+            # (B, C, F, H, W)
+            B, C, F, H, W = data.shape
+            for b in range(B):
+                frames = []
+                for f in range(F):
+                    # (C, H, W) → (H, W, C)
+                    frame = data[b, :, f].transpose(1, 2, 0)
+                    if C == 1:
+                        frame = frame.squeeze(-1)
+                    frames.append(Image.fromarray(frame))
+                all_batches.append(frames)
+        elif data.ndim == 4:
+            # (B, C, H, W) — single image per batch
+            B, C, H, W = data.shape
+            for b in range(B):
+                frame = data[b].transpose(1, 2, 0)
+                if C == 1:
+                    frame = frame.squeeze(-1)
+                all_batches.append([Image.fromarray(frame)])
+        else:
+            raise ValueError(f"Expected 4-D or 5-D tensor, got {data.ndim}-D")
+
+        return PipelineOutput(frames=all_batches)
 
 def _load_pipeline(*args, **kwargs):
     return ToraPipeline(*args, **kwargs)

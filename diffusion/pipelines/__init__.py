@@ -2,11 +2,12 @@
 
 # Expose all pipelines for direct import
 from ._base import DiffusionPipeline, StableDiffusionPipeline, CogVideoXPipeline
-from .tora import ToraPipeline, _load_pipeline
+from .tora import ToraPipeline, _load_pipeline, PipelineOutput
 
 __all__ = [
     'ToraPipeline',
     '_load_pipeline',
+    'PipelineOutput',
     'DiffusionPipeline',
     'StableDiffusionPipeline',
     'CogVideoXPipeline']

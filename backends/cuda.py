@@ -73,9 +73,36 @@ def is_built() -> bool:
     return _CUDA
 
 
+# ── Delegated runtime APIs (mirror scaffolding.cuda for convenience) ──
+
+def is_available() -> bool:
+    """Return True if CUDA is available (delegates to scaffolding.cuda)."""
+    from ..cuda import is_available as _is_avail
+    return _is_avail()
+
+
+def get_device_properties(device: int = 0):
+    """Return device properties (delegates to scaffolding.cuda)."""
+    from ..cuda import get_device_properties as _get_props
+    return _get_props(device)
+
+
+def empty_cache() -> None:
+    """Release cached CUDA memory (delegates to scaffolding.cuda)."""
+    from ..cuda import empty_cache as _empty
+    _empty()
+
+
+def device_count() -> int:
+    """Number of CUDA devices (delegates to scaffolding.cuda)."""
+    from ..cuda import device_count as _dc
+    return _dc()
+
+
 __all__ = [
     'matmul', 'is_built',
     'enable_flash_sdp', 'flash_sdp_enabled',
     'enable_math_sdp', 'math_sdp_enabled',
     'enable_cudnn_sdp', 'cudnn_sdp_enabled',
+    'is_available', 'get_device_properties', 'empty_cache', 'device_count',
 ]

@@ -74,11 +74,35 @@ def get_device_name(device: int = 0) -> str:
         return "Scaffolding-CPU"
 
 
-def get_device_properties(device: int = 0) -> dict:
-    """Return a dict of device properties."""
+class DeviceProperties:
+    """CUDA device properties with attribute access (mirrors torch)."""
+    def __init__(self, props: dict):
+        self.name: str = props.get('name', 'CPU')
+        self.major: int = props.get('major', 0)
+        self.minor: int = props.get('minor', 0)
+        self.total_memory: int = props.get('total_memory', 0)
+        self.multi_processor_count: int = props.get('multi_processor_count', 0)
+        self._raw = props
+
+    def __repr__(self):
+        return (f"DeviceProperties(name='{self.name}', major={self.major}, "
+                f"minor={self.minor}, total_memory={self.total_memory})")
+
+    def __getattr__(self, name):
+        try:
+            return self._raw[name]
+        except KeyError:
+            raise AttributeError(f"DeviceProperties has no attribute '{name}'")
+
+
+def get_device_properties(device: int = 0) -> DeviceProperties:
+    """Return device properties as an object with attribute access."""
     if not _CUDA_AVAILABLE:
-        return {'name': 'CPU', 'major': 0, 'minor': 0, 'total_memory': 0}
-    return _cops.get_device_properties(device)
+        return DeviceProperties({'name': 'CPU', 'major': 0, 'minor': 0, 'total_memory': 0})
+    raw = _cops.get_device_properties(device)
+    if isinstance(raw, dict):
+        return DeviceProperties(raw)
+    return raw
 
 
 def set_device(device: int) -> None:
