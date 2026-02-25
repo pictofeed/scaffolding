@@ -500,6 +500,7 @@ setup(
         'scaffolding.distributed': 'distributed',
         'scaffolding.utils': 'utils',
         'scaffolding.diffusion': 'diffusion',
+        'scaffolding.diffusion.tora': 'diffusion',
     },
     packages=[
         'scaffolding',
@@ -510,6 +511,7 @@ setup(
         'scaffolding.distributed',
         'scaffolding.utils',
         'scaffolding.diffusion',
+        'scaffolding.diffusion.tora',
     ],
     ext_modules=extensions,
     cmdclass={'build_ext': CudaBuildExt},
