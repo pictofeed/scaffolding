@@ -2,6 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """Diffusion utilities — noise helpers, guidance, and schedule builders.
 
 Shared helpers used across schedulers, models, and pipelines:
@@ -17,7 +18,7 @@ import math
 import numpy as np
 from typing import Optional, Tuple, Union, Sequence
 
-from ..tensor import Tensor
+from scaffolding.tensor import Tensor
 
 
 # ═════════════════════════════════════════════════════════════════════

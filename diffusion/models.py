@@ -2,6 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """Diffusion model architectures — UNet2D, DiT, AutoencoderKL.
 
 Provides the core neural-network building blocks used by diffusion
@@ -20,11 +21,11 @@ import math
 import numpy as np
 from typing import Optional, Tuple
 
-from ..tensor import Tensor
-from .. import autograd as _ag
-from ..nn.module import Module, ModuleList, Sequential
-from ..nn.parameter import Parameter
-from ..nn.layers import (
+from scaffolding.tensor import Tensor
+from scaffolding import autograd as _ag
+from scaffolding.nn.module import Module, ModuleList, Sequential
+from scaffolding.nn.parameter import Parameter
+from scaffolding.nn.layers import (
     Linear, Conv2d, Conv3d, ConvTranspose2d,
     GroupNorm, LayerNorm, SiLU, Dropout, Embedding,
     _param_to_device, _default_param_device,

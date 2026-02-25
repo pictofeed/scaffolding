@@ -2,6 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """scaffolding.diffusion — Diffusion models, schedulers, and pipelines.
 
 A comprehensive diffusion modelling package providing noise schedulers

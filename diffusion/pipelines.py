@@ -2,6 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """Diffusion pipelines — end-to-end generation abstractions.
 
 Provides ready-to-use pipeline classes that orchestrate a VAE,
@@ -21,19 +22,19 @@ import math
 import numpy as np
 from typing import Optional, Callable, Union
 
-from ..tensor import Tensor
-from .. import autograd as _ag
-from ..nn.module import Module
+from scaffolding.tensor import Tensor
+from scaffolding import autograd as _ag
+from scaffolding.nn.module import Module
 
-from .schedulers import (
+from scaffolding.diffusion.schedulers import (
     DDIMScheduler,
     CogVideoXDPMScheduler,
 )
-from .models import (
+from scaffolding.diffusion.models import (
     UNet2DConditionModel,
     AutoencoderKL,
 )
-from .utils import classifier_free_guidance, randn_tensor
+from scaffolding.diffusion.utils import classifier_free_guidance, randn_tensor
 
 
 # ═════════════════════════════════════════════════════════════════════

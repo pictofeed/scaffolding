@@ -1,8 +1,8 @@
-    # ╔══════════════════════════════════════════════════════════════════════╗
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """
 ToraPipeline — Alibaba's TORA diffusion pipeline (Scaffolding reimplementation).
 
@@ -13,12 +13,12 @@ from __future__ import annotations
 import numpy as np
 from typing import Optional, Callable
 
-from ..tensor import Tensor
-from .. import autograd as _ag
-from ..nn.module import Module
-from .schedulers import DDIMScheduler
-from .models import UNet2DConditionModel, AutoencoderKL
-from .utils import classifier_free_guidance, randn_tensor
+from scaffolding.tensor import Tensor
+from scaffolding import autograd as _ag
+from scaffolding.nn.module import Module
+from scaffolding.diffusion.schedulers import DDIMScheduler
+from scaffolding.diffusion.models import UNet2DConditionModel, AutoencoderKL
+from scaffolding.diffusion.utils import classifier_free_guidance, randn_tensor
 
 class ToraPipeline:
     

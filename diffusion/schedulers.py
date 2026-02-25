@@ -2,6 +2,7 @@
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
 # ╚══════════════════════════════════════════════════════════════════════╝
+
 """Noise schedulers for diffusion models.
 
 Implements the full family of noise schedules and sampling strategies
