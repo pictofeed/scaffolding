@@ -77,7 +77,6 @@ scaffolding/
 ├── pyproject.toml           # PEP 517 build metadata
 └── requirements.txt         # Runtime dependencies
 ```
-
 ### Cython Extensions
 
 | Extension | File | Description |
@@ -140,7 +139,100 @@ make wheel
 
 Scaffolding provides two independent build systems. Both produce the same compiled `.so` extensions.
 
-### 1. Setuptools + Cython (Default)
+
+## Diffusion Models & Pipelines
+
+Scaffolding provides a full-featured, modular diffusion package in `scaffolding.diffusion` for both image and video generation, including:
+
+- **Noise Schedulers:**
+    - `DDPMScheduler`, `DDIMScheduler`, `DPMSolverMultistepScheduler`, `CogVideoXDPMScheduler`, `EulerDiscreteScheduler`, `PNDMScheduler`, `FlowMatchEulerDiscreteScheduler`
+- **Model Architectures:**
+    - `UNet2DConditionModel` (Stable Diffusion-style), `DiTModel` (Diffusion Transformer), `AutoencoderKL` (VAE for latent diffusion)
+- **Pipelines:**
+    - `DiffusionPipeline` (base), `StableDiffusionPipeline`, `CogVideoXPipeline`
+- **Utilities:**
+    - `classifier_free_guidance`, `rescale_noise_cfg`, `randn_tensor`, `get_beta_schedule`
+
+### Example: Stable Diffusion Pipeline
+
+```python
+from scaffolding.diffusion import (
+        StableDiffusionPipeline, UNet2DConditionModel, AutoencoderKL, DDPMScheduler
+)
+
+# Instantiate components
+unet = UNet2DConditionModel()
+vae = AutoencoderKL()
+sched = DDPMScheduler()
+
+pipe = StableDiffusionPipeline(
+        unet=unet,
+        scheduler=sched,
+        vae=vae,
+)
+
+# Generate image from prompt embeddings (see text encoder integration)
+prompt_embeds = ...  # (B, S, D) text embeddings
+image = pipe(prompt_embeds=prompt_embeds, num_inference_steps=50)
+print(image.shape)  # (B, 3, H, W)
+```
+
+### Example: CogVideoX Video Diffusion
+
+```python
+from scaffolding.diffusion import (
+        CogVideoXPipeline, CogVideoXDPMScheduler, DiTModel
+)
+
+transformer = DiTModel(patch_size=2, in_channels=16, hidden_size=1152, depth=28)
+sched = CogVideoXDPMScheduler(
+        num_train_timesteps=1000,
+        snr_shift_scale=3.0,
+        prediction_type='v_prediction',
+)
+
+pipe = CogVideoXPipeline(
+        transformer=transformer,
+        scheduler=sched,
+        num_frames=49,
+        latent_channels=16,
+)
+
+# Generate video from prompt embeddings
+prompt_embeds = ...  # (B, S, D) text embeddings
+video = pipe(prompt_embeds=prompt_embeds, num_inference_steps=50)
+print(video.shape)  # (B, 16, 49, H, W)
+```
+
+### Schedulers Overview
+
+| Scheduler | Description |
+|---|---|
+| `DDPMScheduler` | Classic DDPM (Ho et al. 2020), linear/cosine beta schedules |
+| `DDIMScheduler` | Deterministic DDIM (Song et al. 2020), fast sampling |
+| `DPMSolverMultistepScheduler` | DPM-Solver++ (Lu et al. 2022), high-quality ODE solver |
+| `CogVideoXDPMScheduler` | SNR-shifted DPM-Solver++ for video, temporal coherence (CogVideoX) |
+| `EulerDiscreteScheduler` | Euler ancestral sampler (Karras et al. 2022) |
+| `PNDMScheduler` | Pseudo Numerical Diffusion (Liu et al. 2022), 4th-order multistep |
+| `FlowMatchEulerDiscreteScheduler` | Flow Matching (Lipman et al. 2023), SD3/FLUX |
+
+#### CogVideoXDPMScheduler Highlights
+
+- SNR-shifted schedule for temporal coherence in video diffusion
+- Configurable timestep spacing (`linspace`, `leading`, `trailing`)
+- Dynamic thresholding (Imagen-style) for high guidance scales
+- Zero-terminal-SNR rescaling option
+- DPM-Solver++ first/second-order solvers
+- Supports `v_prediction`, `epsilon`, and `sample` prediction types
+
+### Utilities
+
+- `classifier_free_guidance(model, latents, timesteps, prompt_embeds, negative_prompt_embeds, guidance_scale)` — Run a model with classifier-free guidance in one call
+- `rescale_noise_cfg(noise_pred, noise_pred_text, guidance_rescale=0.7)` — Imagen-style guidance rescaling
+- `randn_tensor(shape, seed=None)` — Generate random noise as a Tensor
+- `get_beta_schedule(schedule, num_timesteps, beta_start, beta_end)` — Build beta schedules for custom schedulers
+
+---
 
 ```bash
 # Build extensions in-place for development
