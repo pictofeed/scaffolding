@@ -54,6 +54,8 @@ from .pipelines import (
     StableDiffusionPipeline,
     CogVideoXPipeline,
 )
+# ── TORA Pipeline ──
+from .tora import ToraPipeline, _load_pipeline
 
 # ── Utilities ──
 from .utils import (
@@ -80,6 +82,8 @@ __all__ = [
     'DiffusionPipeline',
     'StableDiffusionPipeline',
     'CogVideoXPipeline',
+    'ToraPipeline',
+    '_load_pipeline',
     # Utilities
     'classifier_free_guidance',
     'rescale_noise_cfg',

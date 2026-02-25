@@ -1,3 +1,13 @@
+class AutoencoderKL(Module):
+    # ...existing code...
+
+    def enable_slicing(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
+
+    def enable_tiling(self):
+        """No-op for compatibility with memory optimization APIs."""
+        pass
 # ╔══════════════════════════════════════════════════════════════════════╗
 # ║  Scaffolding — Deep Learning Framework                               ║
 # ║  Copyright © 2026 Pictofeed, LLC. All rights reserved.               ║
