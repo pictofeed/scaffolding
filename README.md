@@ -14,8 +14,9 @@ Scaffolding is a lightweight, production-ready deep learning framework built fro
 
 - **Pure Python + Cython** — no external C++ dependencies; every operation is implemented in Python with Cython kernels for the performance-critical paths
 - **Automatic Differentiation** — full reverse-mode autograd engine with gradient accumulation, `no_grad` / `inference_mode` context managers, and `retain_graph` support
-- **Neural Network Modules** — `nn.Module`, `nn.Linear`, `nn.Embedding`, `nn.LayerNorm`, `nn.RMSNorm`, `nn.Dropout`, and more
-- **Functional API** — `nn.functional` with `softmax`, `cross_entropy`, `silu`, `gelu`, `relu`, `dropout`, `embedding`, and others
+- **Neural Network Modules** — `nn.Module`, `nn.Linear`, `nn.Embedding`, `nn.Conv1d`/`Conv2d`/`Conv3d`, `nn.LayerNorm`, `nn.RMSNorm`, `nn.BatchNorm2d`, `nn.GroupNorm`, pooling layers, and more
+- **Functional API** — `nn.functional` with `softmax`, `cross_entropy`, `silu`, `gelu`, `relu`, `conv2d`, `conv3d`, `group_norm`, `interpolate`, and others
+- **Text-to-Video Generation** — complete diffusion-based pipeline with 3D UNet, DDPM/DDIM schedulers, text encoder, and optional VAE latent diffusion
 - **Optimizers** — `AdamW` with weight decay, bias correction, and learning rate scheduling (`CosineAnnealingLR`, `LambdaLR`, `StepLR`)
 - **Apple MPS Backend** — Cython-wrapped Apple Accelerate.framework (cblas, vDSP, vecLib) for hardware-accelerated matmul, elementwise ops, softmax, RMS norm, and cross-entropy on macOS
 - **Gradient Checkpointing** — memory-efficient training via `utils.checkpoint`
@@ -41,8 +42,9 @@ scaffolding/
 ├── nn/
 │   ├── module.py            # nn.Module base class
 │   ├── parameter.py         # nn.Parameter
-│   ├── layers.py            # Linear, Embedding, LayerNorm, RMSNorm, Dropout
-│   ├── functional.py        # Functional API (softmax, cross_entropy, silu, etc.)
+│   ├── layers.py            # Linear, Conv1d/2d/3d, ConvTranspose2d/3d, BatchNorm, GroupNorm, pooling, Upsample, etc.
+│   ├── functional.py        # Functional API (softmax, cross_entropy, conv2d, conv3d, interpolate, etc.)
+│   ├── video.py             # Text-to-video diffusion pipeline (3D UNet, DDPM/DDIM, text encoder)
 │   ├── init.py              # Weight initialization (xavier, kaiming, normal, etc.)
 │   ├── parallel.py          # DistributedDataParallel stub
 │   └── utils.py             # clip_grad_norm_
@@ -341,9 +343,27 @@ All modules inherit from `nn.Module` and support:
 |---|---|
 | `nn.Linear(in, out)` | Fully-connected layer |
 | `nn.Embedding(num, dim)` | Embedding lookup table |
+| `nn.Conv1d(in, out, k)` | 1D convolution |
+| `nn.Conv2d(in, out, k)` | 2D convolution (im2col-based, groups/stride/dilation) |
+| `nn.Conv3d(in, out, k)` | 3D convolution for volumetric/temporal data |
+| `nn.ConvTranspose2d(in, out, k)` | 2D transposed convolution (upsampling) |
+| `nn.ConvTranspose3d(in, out, k)` | 3D transposed convolution |
+| `nn.BatchNorm2d(features)` | 2D batch normalization with running stats |
+| `nn.BatchNorm3d(features)` | 3D batch normalization |
 | `nn.LayerNorm(dim)` | Layer normalization |
 | `nn.RMSNorm(dim)` | Root mean square normalization |
+| `nn.GroupNorm(groups, channels)` | Group normalization |
+| `nn.AvgPool2d(k)` | Average pooling |
+| `nn.MaxPool2d(k)` | Max pooling |
+| `nn.AdaptiveAvgPool2d(size)` | Adaptive average pooling |
+| `nn.Upsample(scale)` | Nearest/bilinear/trilinear upsampling |
+| `nn.PixelShuffle(r)` | Sub-pixel convolution shuffle |
 | `nn.Dropout(p)` | Dropout regularization |
+| `nn.SiLU()` | SiLU / Swish activation |
+| `nn.ReLU()` | ReLU activation |
+| `nn.GELU()` | GELU activation |
+| `nn.Tanh()` | Tanh activation |
+| `nn.Sigmoid()` | Sigmoid activation |
 
 ### Weight Initialization
 
@@ -441,6 +461,100 @@ class DeepModel(nn.Module):
 | `x.reshape(shape)` | View/reshape |
 | `x.transpose(d0, d1)` | Transpose |
 | `x.contiguous()` | Ensure contiguous layout |
+
+---
+
+## Convolutions
+
+Scaffolding implements 1D, 2D, and 3D convolutions with full support for stride, padding, dilation, groups, and bias. The forward pass uses an im2col approach with `np.einsum` for efficient batched matrix multiplication. Backward passes (autograd) are fully implemented.
+
+```python
+import scaffolding as sf
+import scaffolding.nn as nn
+import scaffolding.nn.functional as F
+
+# 2D Convolution
+conv = nn.Conv2d(3, 64, kernel_size=3, stride=1, padding=1)
+x = sf.randn(4, 3, 32, 32)  # (batch, channels, height, width)
+out = conv(x)               # (4, 64, 32, 32)
+
+# 3D Convolution (video / volumetric)
+conv3d = nn.Conv3d(3, 64, kernel_size=3, padding=1)
+vid = sf.randn(1, 3, 16, 32, 32)  # (batch, channels, depth, height, width)
+out3d = conv3d(vid)                # (1, 64, 16, 32, 32)
+
+# Functional API
+weight = sf.randn(64, 3, 3, 3)
+out = F.conv2d(x, weight, padding=1)
+
+# Transposed convolution (upsampling)
+up = nn.ConvTranspose2d(64, 32, kernel_size=2, stride=2)
+out_up = up(out)  # spatial dimensions doubled
+```
+
+---
+
+## Text-to-Video Generation
+
+Scaffolding includes a complete text-to-video diffusion pipeline in `nn.video`. The system uses a 3D UNet denoising architecture with spatial-temporal attention and DDIM sampling.
+
+### Architecture
+
+| Component | Class | Description |
+|---|---|---|
+| Tokenizer | `TextTokenizer` | Hash-based word tokenizer (vocab 8192, max length 77) |
+| Text Encoder | `TextEncoder` | Multi-layer transformer with self-attention + positional embeddings |
+| Timestep Embedding | `TimestepEmbedding` | Sinusoidal encoding + MLP for diffusion timestep conditioning |
+| Denoising UNet | `SimpleUNet3D` / `UNet3D` | Encoder-bottleneck-decoder with skip connections and cross-attention |
+| Residual Block | `ResBlock3D` | Conv3d + GroupNorm + SiLU with timestep conditioning |
+| Attention | `SpatialTemporalAttention` | Self-attention + cross-attention with text context |
+| Noise Scheduler | `DDPMScheduler` / `DDIMScheduler` | Linear/cosine beta schedules, forward noise, reverse denoising |
+| VAE (optional) | `VideoEncoder` / `VideoDecoder` | Encode video to latent space for latent diffusion |
+| Pipeline | `TextToVideoPipeline` | End-to-end generation with classifier-free guidance |
+
+### Usage
+
+```python
+from scaffolding.nn.video import TextToVideoPipeline
+
+# Create pipeline
+pipeline = TextToVideoPipeline(
+    num_frames=16,
+    frame_height=64,
+    frame_width=64,
+    text_embed_dim=256,
+    model_channels=64,
+    num_heads=4,
+)
+
+# Generate video from text prompt
+video = pipeline.generate(
+    prompt="a cat walking on grass",
+    num_steps=50,
+    guidance_scale=7.5,
+)
+print(video.shape)  # (1, 3, 16, 64, 64) — (B, C, T, H, W)
+
+# Save frames to disk
+pipeline.save_video_frames(video, output_dir="./output_frames")
+```
+
+### Training
+
+```python
+import scaffolding as sf
+import scaffolding.optim as optim
+
+pipeline = TextToVideoPipeline(num_frames=16, frame_height=64, frame_width=64)
+optimizer = optim.AdamW(pipeline.parameters(), lr=1e-4)
+
+# Training loop
+for video_batch, prompts in dataloader:
+    loss = pipeline.training_step(video_batch, prompts)
+    loss.backward()
+    optimizer.step()
+    optimizer.zero_grad()
+```
 
 ---
 
