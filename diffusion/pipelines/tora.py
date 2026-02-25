@@ -33,15 +33,11 @@ class ToraPipeline:
         Returns:
             ToraPipeline instance with loaded weights.
         """
-        # Example loading logic (user should adapt as needed):
-        # Load UNet, scheduler, VAE, text_encoder, tokenizer from model_path
-        # Here we use placeholders; user should implement actual loading logic.
         unet = UNet2DConditionModel.from_pretrained(model_path, dtype=dtype) if hasattr(UNet2DConditionModel, 'from_pretrained') else UNet2DConditionModel()
         vae = AutoencoderKL.from_pretrained(model_path, dtype=dtype) if hasattr(AutoencoderKL, 'from_pretrained') else None
         scheduler = DDIMScheduler.from_pretrained(model_path) if hasattr(DDIMScheduler, 'from_pretrained') else DDIMScheduler()
         text_encoder = None
         tokenizer = None
-        # Allow overrides via kwargs
         return cls(
             unet=unet,
             scheduler=scheduler,
@@ -54,19 +50,7 @@ class ToraPipeline:
     def enable_sequential_cpu_offload(self):
         """No-op for compatibility with memory optimization APIs."""
         pass
-    
-    """
-    ToraPipeline: Text-to-image diffusion pipeline inspired by Alibaba's TORA.
 
-    Args:
-        unet:           UNet2DConditionModel instance.
-        scheduler:      DDIMScheduler or compatible scheduler.
-        vae:            AutoencoderKL instance (optional).
-        text_encoder:   Module for text encoding (optional).
-        tokenizer:      Callable for tokenization (optional).
-        latent_channels: Number of latent channels (default: 4).
-        latent_scale:   VAE spatial scale factor (default: 8).
-    """
     def __init__(
         self,
         unet: UNet2DConditionModel,
@@ -99,18 +83,12 @@ class ToraPipeline:
         callback: Optional[Callable] = None,
         callback_steps: int = 1,
     ) -> Tensor:
-        """
-        Run the TORA generation loop.
-        Returns: Tensor of shape (B, 3, H, W) with pixel values in [-1, 1].
-        """
         if prompt_embeds is None:
             raise ValueError("prompt_embeds is required (or set text_encoder + tokenizer)")
         B = prompt_embeds._data.shape[0] if hasattr(prompt_embeds, '_data') else 1
         lH = height // self.latent_scale
         lW = width // self.latent_scale
-        # Initialise latents
         latents = randn_tensor((B, self.latent_channels, lH, lW), seed=seed)
-        # Set scheduler timesteps
         self.scheduler.set_timesteps(num_inference_steps)
         timesteps = self.scheduler.timesteps
         for i, t in enumerate(timesteps):
@@ -137,7 +115,6 @@ class ToraPipeline:
                         noise_pred, int(t), latents)
             if callback is not None and (i + 1) % callback_steps == 0:
                 callback(i + 1, t, latents)
-        # Decode
         if self.vae is not None:
             latents._ensure_cpu()
             z = Tensor._wrap(
@@ -153,5 +130,4 @@ class ToraPipeline:
         return images
 
 def _load_pipeline(*args, **kwargs):
-    """Factory for ToraPipeline (for API symmetry)."""
     return ToraPipeline(*args, **kwargs)
