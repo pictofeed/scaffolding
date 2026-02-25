@@ -97,5 +97,4 @@ __all__ = [
     'nn', 'optim', 'distributed', 'backends', 'cuda', 'utils', 'diffusion',
 ]
 
-# Import diffusion last to avoid circular import issues
-from . import diffusion
+# Do not import diffusion here to avoid circular import issues. Users should import scaffolding.diffusion directly.
