@@ -57,9 +57,22 @@ class ToraPipeline:
             model_path: Path to the pretrained model directory.
             dtype: Optional dtype for model weights.
             kwargs: Additional arguments for pipeline construction.
+                    HuggingFace-style kwargs (device_map, low_cpu_mem_usage,
+                    torch_dtype, etc.) are accepted and silently ignored so
+                    callers can use the same API as diffusers pipelines.
         Returns:
             ToraPipeline instance with loaded weights.
         """
+        # Strip HuggingFace / diffusers kwargs that have no scaffolding equivalent
+        _HF_IGNORED = {
+            "device_map", "low_cpu_mem_usage", "torch_dtype", "variant",
+            "use_safetensors", "safety_checker", "feature_extractor",
+            "requires_safety_checker", "load_connected_pipeline",
+            "custom_pipeline", "custom_revision", "provider",
+            "sess_options", "trust_remote_code", "revision",
+        }
+        init_kwargs = {k: v for k, v in kwargs.items() if k not in _HF_IGNORED}
+
         unet = UNet2DConditionModel.from_pretrained(model_path, dtype=dtype) if hasattr(UNet2DConditionModel, 'from_pretrained') else UNet2DConditionModel()
         vae = AutoencoderKL.from_pretrained(model_path, dtype=dtype) if hasattr(AutoencoderKL, 'from_pretrained') else None
         scheduler = DDIMScheduler.from_pretrained(model_path) if hasattr(DDIMScheduler, 'from_pretrained') else DDIMScheduler()
@@ -71,7 +84,7 @@ class ToraPipeline:
             vae=vae,
             text_encoder=text_encoder,
             tokenizer=tokenizer,
-            **kwargs
+            **init_kwargs
         )
 
     def enable_sequential_cpu_offload(self):
