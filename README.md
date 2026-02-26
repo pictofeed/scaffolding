@@ -4,24 +4,26 @@
 
 # Scaffolding
 
-**A deep learning framework written entirely in Python and Cython.**
+**A deep learning framework written entirely in Python, Cython, and CUDA C.**
 
-Scaffolding is a lightweight, production-ready deep learning framework built from the ground up using NumPy as its computational backend and Cython-accelerated hot-path operations for maximum throughput. On macOS, Scaffolding leverages Apple's Accelerate framework (BLAS, vDSP, vecLib) through native Cython bindings for near-hardware-level performance on both CPU and Apple Silicon.
+Scaffolding is a lightweight, production-ready deep learning framework built from the ground up using NumPy as its computational backend, Cython-accelerated hot-path operations, and native CUDA kernels for NVIDIA GPU execution. On macOS, Scaffolding leverages Apple's Accelerate framework (BLAS, vDSP, vecLib) through native Cython bindings for near-hardware-level performance on both CPU and Apple Silicon. On NVIDIA GPUs, tensors live entirely in VRAM with no PyTorch dependency — ideal for RAM-constrained GPU servers.
 
 ---
 
 ## Features
 
-- **Pure Python + Cython** — no external C++ dependencies; every operation is implemented in Python with Cython kernels for the performance-critical paths
+- **Pure Python + Cython + CUDA C** — no PyTorch or external framework dependencies; every operation is implemented in Python with Cython kernels and CUDA C for the performance-critical GPU paths
 - **Automatic Differentiation** — full reverse-mode autograd engine with gradient accumulation, `no_grad` / `inference_mode` context managers, and `retain_graph` support
 - **Neural Network Modules** — `nn.Module`, `nn.Linear`, `nn.Embedding`, `nn.Conv1d`/`Conv2d`/`Conv3d`, `nn.LayerNorm`, `nn.RMSNorm`, `nn.BatchNorm2d`, `nn.GroupNorm`, pooling layers, and more
 - **Functional API** — `nn.functional` with `softmax`, `cross_entropy`, `silu`, `gelu`, `relu`, `conv2d`, `conv3d`, `group_norm`, `interpolate`, and others
-- **Text-to-Video Generation** — complete diffusion-based pipeline with 3D UNet, DDPM/DDIM schedulers, text encoder, and optional VAE latent diffusion
+- **Text-to-Video Generation** — complete diffusion-based pipeline with 3D UNet, DDPM/DDIM schedulers, Tora (CogVideoX DiT), text encoder, and optional VAE latent diffusion
+- **NVIDIA CUDA Backend** — GPU-resident tensors (`GpuTensor`) with zero-copy VRAM storage, automatic upload for all numeric dtypes (`float16`/`float32`/`float64`/`uint8`/`int8`–`int64`), device-to-device copy, and fused CUDA kernels for elementwise ops, matmul, linear forward, SiLU, and embedding lookup
+- **Streaming Memory Management** — designed for RAM-constrained GPU hosts (e.g. 2.5 GB system RAM + 24 GB VRAM): `Module._release_cpu_shadows()` drops CPU weight copies after forward passes, mini-batched UNet inference (`_UNET_FRAME_BATCH`), frame-by-frame VAE decode, and `malloc_trim` integration on Linux
 - **Optimizers** — `AdamW` with weight decay, bias correction, and learning rate scheduling (`CosineAnnealingLR`, `LambdaLR`, `StepLR`)
 - **Apple MPS Backend** — Cython-wrapped Apple Accelerate.framework (cblas, vDSP, vecLib) for hardware-accelerated matmul, elementwise ops, softmax, RMS norm, and cross-entropy on macOS
 - **Gradient Checkpointing** — memory-efficient training via `utils.checkpoint`
-- **Device Abstraction** — `cpu` and `mps` device types with `.to()`, `.cpu()`, `.mps()` tensor methods
-- **Dtype System** — `float16`, `float32`, `float64`, `bfloat16`, `int8`–`int64`, `uint8`, `bool`
+- **Device Abstraction** — `cpu`, `cuda`, and `mps` device types with `.to()`, `.cpu()`, `.cuda()`, `.mps()` tensor methods
+- **Dtype System** — `float16`, `float32`, `float64`, `bfloat16`, `int8`–`int64`, `uint8`, `bool` — all uploadable to CUDA
 - **Two Build Systems** — setuptools + Cython *and* CMake, with a Makefile convenience wrapper
 
 ---
@@ -31,16 +33,20 @@ Scaffolding is a lightweight, production-ready deep learning framework built fro
 ```
 scaffolding/
 ├── __init__.py              # Public API surface
-├── tensor.py                # Tensor class, factory functions, math ops
+├── tensor.py                # Tensor class, factory functions, math ops, GPU-resident storage
 ├── autograd.py              # Reverse-mode autograd engine
-├── device.py                # Device abstraction (cpu, mps)
+├── device.py                # Device abstraction (cpu, cuda, mps)
 ├── dtype.py                 # Data type definitions
 │
 ├── _tensor_ops.pyx          # Cython: generic CPU hot-path kernels
 ├── _mps_ops.pyx             # Cython: Apple Accelerate-backed kernels
+├── _cuda_ops.pyx            # Cython: NVIDIA CUDA backend (GpuTensor, device ops)
+├── _cuda_kernels.cu         # CUDA C: fused GPU kernels (elementwise, matmul, linear, SiLU, …)
+├── _cuda_kernels.cuh        # CUDA C: kernel declarations
+├── _cuda_ops_decl.h         # C header: Cython ↔ CUDA bridge declarations
 │
 ├── nn/
-│   ├── module.py            # nn.Module base class
+│   ├── module.py            # nn.Module base class + _release_cpu_shadows()
 │   ├── parameter.py         # nn.Parameter
 │   ├── layers.py            # Linear, Conv1d/2d/3d, ConvTranspose2d/3d, BatchNorm, GroupNorm, pooling, Upsample, etc.
 │   ├── functional.py        # Functional API (softmax, cross_entropy, conv2d, conv3d, interpolate, etc.)
@@ -53,13 +59,21 @@ scaffolding/
 │   ├── optimizer.py         # AdamW optimizer
 │   └── lr_scheduler.py      # Learning rate schedulers
 │
+├── diffusion/
+│   ├── models.py            # UNet2DConditionModel, DiTModel, AutoencoderKL
+│   ├── schedulers.py        # DDPM, DDIM, DPM-Solver++, CogVideoXDPM, Euler, PNDM, FlowMatch
+│   ├── utils.py             # classifier_free_guidance, randn_tensor, get_beta_schedule
+│   └── pipelines/
+│       ├── _base.py          # DiffusionPipeline, StableDiffusionPipeline, CogVideoXPipeline
+│       └── tora.py           # ToraPipeline (CogVideoX DiT + trajectory control)
+│
 ├── backends/
 │   ├── mps.py               # MPS/Accelerate backend detection & dispatch
-│   ├── cuda.py              # CUDA backend stub
-│   └── cudnn.py             # cuDNN backend stub
+│   ├── cuda.py              # CUDA backend — device properties, cache, TF32 control
+│   └── cudnn.py             # cuDNN backend configuration
 │
 ├── cuda/
-│   └── amp.py               # Automatic mixed precision stub
+│   └── amp.py               # Automatic mixed precision
 │
 ├── distributed/             # Distributed training stubs
 │   └── __init__.py
@@ -83,6 +97,7 @@ scaffolding/
 |---|---|---|
 | `_tensor_ops` | `_tensor_ops.pyx` | Generic CPU kernels — sigmoid, exp, log, tanh, matmul, softmax, RMS norm, AdamW step. NumPy-backed with `nogil` computation blocks. |
 | `_mps_ops` | `_mps_ops.pyx` | Apple Accelerate kernels — cblas_sgemm/dgemm (BLAS), vDSP vector ops, vecLib transcendentals, fused softmax, RMS norm, cross-entropy, AdamW. Linked against `-framework Accelerate`. |
+| `_cuda_ops` | `_cuda_ops.pyx` + `_cuda_kernels.cu` | NVIDIA CUDA backend — `GpuTensor` GPU-resident storage, `CudaBuffer` memory management, fused elementwise kernels (float4-vectorised add/sub/mul/div/scalar), `cuda_linear_forward`, `cuda_silu`, `cuda_embedding`, device-to-device copy, `empty_cache`. Supports all numeric dtypes. |
 
 ---
 
@@ -98,6 +113,11 @@ scaffolding/
 **macOS MPS Backend** (optional):
 - macOS with Accelerate.framework (included in Xcode Command Line Tools)
 - Apple Silicon (arm64) or Intel Mac with Metal support
+
+**NVIDIA CUDA Backend** (optional):
+- NVIDIA GPU with CUDA compute capability ≥ 3.5 (Kepler K80 or newer)
+- CUDA Toolkit ≥ 11.0
+- No PyTorch required — scaffolding ships its own CUDA kernels
 
 ---
 
@@ -149,7 +169,7 @@ Scaffolding provides a full-featured, modular diffusion package in `scaffolding.
 - **Model Architectures:**
     - `UNet2DConditionModel` (Stable Diffusion-style), `DiTModel` (Diffusion Transformer), `AutoencoderKL` (VAE for latent diffusion)
 - **Pipelines:**
-    - `DiffusionPipeline` (base), `StableDiffusionPipeline`, `CogVideoXPipeline`
+    - `DiffusionPipeline` (base), `StableDiffusionPipeline`, `CogVideoXPipeline`, `ToraPipeline`
 - **Utilities:**
     - `classifier_free_guidance`, `rescale_noise_cfg`, `randn_tensor`, `get_beta_schedule`
 
@@ -175,6 +195,41 @@ pipe = StableDiffusionPipeline(
 prompt_embeds = ...  # (B, S, D) text embeddings
 image = pipe(prompt_embeds=prompt_embeds, num_inference_steps=50)
 print(image.shape)  # (B, 3, H, W)
+```
+
+### Example: Tora Text-to-Video (GPU-Resident Output)
+
+```python
+from scaffolding.diffusion.pipelines.tora import ToraPipeline
+from scaffolding.diffusion.schedulers import CogVideoXDPMScheduler
+import scaffolding as sf
+
+pipe = ToraPipeline.from_pretrained("./models/Tora_T2V", dtype=sf.float16)
+pipe.scheduler = CogVideoXDPMScheduler.from_config(
+    pipe.scheduler.config, timestep_spacing="trailing"
+)
+pipe.to("cuda")
+pipe.vae.enable_slicing()
+pipe.vae.enable_tiling()
+
+# Generate with output_type="sf_tensor" → frames stay on GPU as uint8 tensors
+# No PIL Images or numpy arrays touch CPU RAM
+with sf.inference_mode():
+    output = pipe(
+        prompt="a drone flying over a mountain lake at sunset",
+        num_frames=49,
+        num_inference_steps=50,
+        height=480,
+        width=720,
+        guidance_scale=6.0,
+        output_type="sf_tensor",  # GPU-resident uint8 frames (H, W, C)
+        generator=sf.Generator(device="cuda").manual_seed(42),
+    )
+
+# output.frames[0] is a list of GPU-resident sf.Tensor (H, W, C) uint8
+print(len(output.frames[0]))  # 49 frames
+print(output.frames[0][0].shape)  # (480, 720, 3)
+print(output.frames[0][0].device)  # cuda:0
 ```
 
 ### Example: CogVideoX Video Diffusion
@@ -242,7 +297,7 @@ python setup.py build_ext --inplace
 make build
 ```
 
-This compiles `_tensor_ops.pyx` and (on macOS) `_mps_ops.pyx` into shared libraries using Cython's optimized compiler directives:
+This compiles `_tensor_ops.pyx`, (on macOS) `_mps_ops.pyx`, and (when CUDA is available) `_cuda_ops.pyx` + `_cuda_kernels.cu` into shared libraries using Cython's optimized compiler directives:
 
 - `boundscheck=False`
 - `wraparound=False`
@@ -266,8 +321,10 @@ The CMake build automatically detects:
 - Python interpreter and NumPy include paths
 - Cython compiler
 - Accelerate.framework and Metal.framework (macOS)
+- CUDA Toolkit and `nvcc` compiler (Linux/Windows)
 
 MPS extensions are conditionally compiled only when Accelerate is found.
+CUDA extensions (`_cuda_ops` + `_cuda_kernels.cu`) are compiled only when `nvcc` is on `$PATH`.
 
 ### Makefile Targets
 
@@ -330,6 +387,36 @@ optimizer.step()
 optimizer.zero_grad()
 ```
 
+### Using the CUDA Backend (NVIDIA GPUs)
+
+```python
+import scaffolding as sf
+import scaffolding.backends.cuda as cuda
+
+if cuda.is_available():
+    print(f"GPUs: {cuda.device_count()}")
+    props = cuda.get_device_properties(0)
+    print(f"  {props['name']}: {props['total_memory'] / 1e9:.1f} GB VRAM")
+
+    x = sf.randn(64, 64).cuda()  # uploaded to GPU
+    y = sf.randn(64, 64).cuda()
+
+    # Matmul dispatches to CUDA kernels
+    z = sf.matmul(x, y)
+
+    # Elementwise ops use fused float4-vectorised CUDA kernels
+    a = sf.sigmoid(x)
+    b = sf.exp(x)
+
+    # Move model weights to GPU (streams one parameter at a time)
+    model = MLP(256, 512, 10)
+    model.to("cuda")  # parameters & buffers uploaded to VRAM
+
+    # After forward pass, drop CPU weight shadows to save host RAM
+    output = model(x)
+    model._release_cpu_shadows()
+```
+
 ### Using the MPS Backend (macOS)
 
 ```python
@@ -347,6 +434,18 @@ if mps.is_available():
     b = sf.exp(x)
     c = sf.softmax(x, dim=-1)
 ```
+
+When a tensor is on the `cuda` device, operations dispatch to fused CUDA C kernels:
+
+| Operation | CUDA Kernel |
+|---|---|
+| Elementwise add/sub/mul/div | `float4`-vectorised `cuda_add`, `cuda_sub`, `cuda_mul`, `cuda_div` |
+| Scalar multiply / add | `cuda_scalar_mul`, `cuda_scalar_add` |
+| Linear forward | `cuda_linear_forward` (fused matmul + bias) |
+| SiLU | `cuda_silu` |
+| Embedding lookup | `cuda_embedding` |
+| Memory transfer | `cuda_memcpy_dtod` (device-to-device) |
+| Cache management | `empty_cache` (VRAM cleanup) |
 
 When a tensor is on the `mps` device, operations automatically dispatch to Apple Accelerate's optimized implementations:
 
@@ -370,7 +469,7 @@ When a tensor is on the `mps` device, operations automatically dispatch to Apple
 
 ### Smoke Test
 
-Runs an end-to-end check of all major subsystems — tensors, autograd, modules, optimizers, functional ops, and MPS detection:
+Runs an end-to-end check of all major subsystems — tensors, autograd, modules, optimizers, functional ops, MPS detection, and CUDA device support:
 
 ```bash
 PYTHONPATH=. python tests/smoke_test.py
@@ -427,7 +526,8 @@ All modules inherit from `nn.Module` and support:
 - `named_parameters()` — iterate with names
 - `state_dict()` / `load_state_dict()` — serialization
 - `train()` / `eval()` — mode switching
-- `to(device)` — device transfer
+- `to(device)` — device transfer (streams parameters one-by-one to avoid peak RSS spikes)
+- `_release_cpu_shadows()` — drop CPU copies of GPU-resident parameters to free host RAM
 
 ### Available Layers
 
@@ -518,6 +618,42 @@ class DeepModel(nn.Module):
         x = checkpoint(self.block2, x)
         return x
 ```
+
+---
+
+## GPU Memory Management
+
+Scaffolding is designed to run large models on GPU servers with very limited host RAM (e.g. 2.5 GB system RAM + 24 GB VRAM). Several mechanisms keep CPU memory near zero during inference:
+
+### CPU Shadow Release
+
+When a model is moved to GPU with `.to("cuda")`, parameters are streamed one-by-one to VRAM. After the upload, `_release_cpu_shadows()` drops the CPU-side NumPy arrays, freeing host memory:
+
+```python
+model.to("cuda")
+output = model(x)
+model._release_cpu_shadows()  # free CPU copies of all GPU-resident parameters
+```
+
+This is called automatically by `ToraPipeline` after each UNet mini-batch and VAE decode step.
+
+### Mini-Batched UNet Inference
+
+The `ToraPipeline` denoising loop processes frames in mini-batches of `_UNET_FRAME_BATCH` (default: 4) instead of all frames at once, reducing peak CPU activation memory from hundreds of MB to ~10-15 MB per step.
+
+### Frame-by-Frame VAE Decode
+
+After denoising, the VAE decodes one frame at a time from the latent tensor — never materializing the full `z_data` on the CPU. Each frame is immediately returned as a GPU-resident `sf.Tensor` (`uint8`, shape `(H, W, 3)`).
+
+### Output Types
+
+`ToraPipeline.__call__()` accepts `output_type`:
+- `"pil"` (default) — returns PIL Images (requires CPU RAM for pixel buffers)
+- `"sf_tensor"` — returns GPU-resident `sf.Tensor` objects, keeping all data in VRAM
+
+### Host Memory Cleanup
+
+On Linux, `_release_cpu_shadows()` calls `ctypes.CDLL("libc.so.6").malloc_trim(0)` to return freed pages to the OS immediately, preventing RSS bloat from glibc's `mmap`/`brk` arena retention.
 
 ---
 
