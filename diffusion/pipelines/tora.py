@@ -150,6 +150,7 @@ class ToraPipeline:
         generator: Optional[Any] = None,
         callback: Optional[Callable] = None,
         callback_steps: int = 1,
+        callback_on_step_end: Optional[Callable] = None,
         output_type: str = "pil",
     ) -> Tensor:
         """Run the Tora text-to-video (or trajectory-guided) pipeline.
@@ -173,8 +174,16 @@ class ToraPipeline:
             seed:                 Legacy seed parameter (prefer *generator*).
             generator:            ``scaffolding.Generator`` (or compatible)
                                   for reproducible noise initialisation.
-            callback:             ``callback(step, timestep, latents)``.
+            callback:             Legacy callback:
+                                  ``callback(step, timestep, latents)``.
             callback_steps:       Invoke *callback* every N steps.
+            callback_on_step_end: Diffusers-style callback invoked after
+                                  every denoising step:
+                                  ``callback(pipeline, step, timestep,
+                                  callback_kwargs)``.
+                                  *callback_kwargs* is a dict containing
+                                  ``{"latents": latents}``; the callback
+                                  must return the (possibly modified) dict.
             output_type:          ``"pil"`` (default) returns PipelineOutput
                                   with PIL Images.  ``"sf_tensor"`` returns
                                   PipelineOutput where each frame is a
@@ -353,6 +362,13 @@ class ToraPipeline:
 
             if callback is not None and (i + 1) % callback_steps == 0:
                 callback(i + 1, t, latents)
+
+            # Diffusers-style callback_on_step_end
+            if callback_on_step_end is not None:
+                cb_kwargs = {"latents": latents}
+                cb_result = callback_on_step_end(self, i, t, cb_kwargs)
+                if cb_result is not None:
+                    latents = cb_result.get("latents", latents)
 
         # ── decode latents → PipelineOutput (memory-efficient) ──
         # Stream one frame at a time through the VAE so peak CPU RAM
